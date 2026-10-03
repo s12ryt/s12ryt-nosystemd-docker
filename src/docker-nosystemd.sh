@@ -35,6 +35,7 @@ set -u
 # DSND_FORCE_NET_MODE   full|noiptables|none(強制網路模式,跳過探測)
 # DSND_FORCE_STORAGE    overlay2|vfs(強制存儲驅動)
 # DSND_PROC_STATUS      /proc/self/status 替代路徑(測試用)
+# DSND_USERNS_MODE      dockerd 啟動包裝:auto(默認)| never | force(unshare -Ur)
 # DSND_FORCE_INSTALL   =1 強制重裝(即使 dockerd 已存在)
 
 AUTOSTART_BEGIN="# BEGIN docker-nosystemd autostart"
@@ -221,6 +222,24 @@ probe_unshare_userns_ok() {
     unshare -U true >/dev/null 2>&1
 }
 
+# 是否需要以 user namespace 包裝模式啟動 dockerd(unshare -Ur)。
+# 原理:unshare(CLONE_NEWNS) 檢查「當前 user namespace 內」的 CAP_SYS_ADMIN;
+# 無特權容器直接調用 EPERM,但若核心允許 unprivileged userns,把 dockerd 包進
+# unshare -Ur 後在新 userns 內即擁有全部 caps → 映像層註冊的 unshare/mount 放行
+# (rootless Docker 同原理)。返回 0 = 需要包裝。
+# DSND_USERNS_MODE:auto(默認:直接 unshare -m 可行→不包;不可行且 userns 可行→包)
+#                   / never(禁用)/ force(只要 userns 可行就包)
+userns_wrap_needed() {
+    local mode="${DSND_USERNS_MODE:-auto}"
+    [[ "$mode" == "never" ]] && return 1
+    if [[ "$mode" == "force" ]]; then
+        probe_unshare_userns_ok
+        return
+    fi
+    probe_unshare_mount_ok && return 1
+    probe_unshare_userns_ok
+}
+
 # 讀 /proc/self/status 指定欄位值(如 Seccomp / CapEff);檔案或欄位不存在返回 1
 proc_status_field() { # <欄位名> 例:Seccomp
     local f="${DSND_PROC_STATUS:-/proc/self/status}"
@@ -292,7 +311,12 @@ do_start() {
         fi
     fi
     rm -f "$pidfile"
-    nohup "$dockerdbin" >> "$logfile" 2>&1 &
+    if userns_wrap_needed; then
+        [[ -z "${DSND_QUIET:-}" ]] && log "以 user namespace 包裝模式啟動 dockerd(unshare -Ur):映像層註冊將於 ns 內取得 CAP_SYS_ADMIN"
+        nohup unshare -Ur "$dockerdbin" >> "$logfile" 2>&1 &
+    else
+        nohup "$dockerdbin" >> "$logfile" 2>&1 &
+    fi
     local pid=$!
     echo "$pid" > "$pidfile"
     if wait_daemon_ready; then
@@ -562,8 +586,12 @@ provision_with_fallback() {
             # dockerd 起來 ≠ 可用:映像層註冊需要 unshare(CLONE_NEWNS);
             # 無 CAP_SYS_ADMIN 的容器會在 pull/load 時才爆 EPERM,提前點破
             if ! probe_unshare_mount_ok; then
-                warn "unshare(CLONE_NEWNS)不可用:dockerd 已啟動,但拉取/載入映像會失敗"
-                warn "(failed to register layer: unshare: operation not permitted)。此容器缺少 CAP_SYS_ADMIN,需要宿主以特權模式運行容器才能完整使用 Docker"
+                if userns_wrap_needed; then
+                    log "dockerd 以 user namespace 包裝模式運行:映像層註冊將於 ns 內取得 CAP_SYS_ADMIN(請實測 docker pull)"
+                else
+                    warn "unshare(CLONE_NEWNS)不可用:dockerd 已啟動,但拉取/載入映像會失敗"
+                    warn "(failed to register layer: unshare: operation not permitted)。此容器缺少 CAP_SYS_ADMIN,需要宿主以特權模式運行容器才能完整使用 Docker"
+                fi
             fi
             return 0
         fi
@@ -683,6 +711,7 @@ do_doctor() {
     fi
     printf 'unshare 掛載ns: %s\n' "$(probe_unshare_mount_ok && echo '是' || echo '否(缺 CAP_SYS_ADMIN:映像層註冊將失敗,需宿主開特權)')"
     printf 'user namespace: %s\n' "$(probe_unshare_userns_ok && echo '是' || echo '否(rootless 模式不可用)')"
+    printf 'userns 包裝模式: %s\n' "$(userns_wrap_needed && echo '將啟用(dockerd 包進 unshare -Ur,繞過映像層註冊 EPERM)' || echo '未啟用')"
     printf 'Seccomp       : %s\n' "$sec_desc"
     printf 'CapEff        : %s\n' "$cap_desc"
     printf 'daemon 狀態   : %s\n' "$(is_running && echo "運行中(PID $(cat "${DSND_PID_FILE:-/var/run/docker-nosystemd.pid}"))" || echo '未運行')"

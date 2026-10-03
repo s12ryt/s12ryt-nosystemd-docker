@@ -130,4 +130,5 @@ test_doctor_mentions_unshare_seccomp_capeff() {
   assert_contains "doctor 應顯示 user namespace 探測" "user namespace" "$out"
   assert_contains "doctor 應顯示 Seccomp 狀態" "Seccomp" "$out"
   assert_contains "doctor 應顯示 CapEff 內容" "CapEff" "$out"
+  assert_contains "doctor 應顯示 userns 包裝模式決策" "userns 包裝模式" "$out"
 }

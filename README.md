@@ -64,6 +64,7 @@ sudo bash src/docker-nosystemd.sh install
 DSND_FORCE_NET_MODE=full|noiptables|none   # 強制網路模式(跳過自動探測)
 DSND_FORCE_STORAGE=overlay2|vfs            # 強制存儲驅動
 DSND_FORCE_INSTALL=1                       # 強制重裝 engine
+DSND_USERNS_MODE=auto|never|force          # dockerd 啟動包裝(見下節)
 ```
 
 `start` / `stop` 支援 `--quiet, -q` 靜默模式。
@@ -80,6 +81,17 @@ DSND_FORCE_INSTALL=1                       # 強制重裝 engine
 
 `none` 模式下容器預設無對外網路 — 適合搭配 **Cloudflare Tunnel**(cloudflared)等用户層隧道打通進出,這正是本項目的目標場景之一。
 
+## user namespace 包裝模式(實驗性)
+
+無特權容器缺少 `CAP_SYS_ADMIN` 時,Docker 註冊映像層的 `unshare(CLONE_NEWNS)` 會被拒(見下方已知限制)。若核心允許 unprivileged user namespace,腳本會自動把 dockerd 包進 `unshare -Ur` 啟動 — 在新的 user namespace 內 uid 0 擁有全部 capabilities,映像層註冊即可放行(rootless Docker 同原理)。
+
+- `auto`(默認):直接 `unshare -m` 可行 → 不包裝;被拒但 `unshare -U` 可行 → 自動包裝
+- `never`:禁用;`force`:只要 userns 可行就包裝
+- 探測命令:`unshare -U true && echo 可行`(失敗 = 核心/seccomp 擋了 userns,此模式無法使用)
+- `doctor` 會顯示 `userns 包裝模式` 決策結果
+
+此模式配搭 `vfs` 存儲 + `bridge=none` 網路(腳本會自動降級)即為無特權容器的完整組合;`docker pull` / `docker run` 行為需實機驗證。
+
 ## 開機自啟
 
 無 systemd 時自動注入(冪等,帶 `# BEGIN/END docker-nosystemd autostart` 標記):
@@ -90,7 +102,7 @@ DSND_FORCE_INSTALL=1                       # 強制重裝 engine
 ## 測試
 
 ```bash
-bash tests/run-tests.sh              # 單元測試(bash mini 框架,120 斷言)
+bash tests/run-tests.sh              # 單元測試(bash mini 框架,135 斷言)
 bash tests/run-tests.sh && shellcheck install.sh src/docker-nosystemd.sh
 bash tests/integration/test_install_debian.sh   # 需 root + 無 systemd 的 Debian
 ```
@@ -103,4 +115,4 @@ bash tests/integration/test_install_debian.sh   # 需 root + 無 systemd 的 Deb
 - Alpine 路徑已實作並通過單元測試,但未實機驗證。
 - 極舊核心連 `vfs` 存儲都無法掛載時,腳本會明確報錯退出(不做進一步降級)。
 - `rc.local` 自啟依賴容器內存在 init 進程;純 `profile.d` 注入在無 init 容器仍有效(首個登入時啟動)。
-- **無特權容器(無 `CAP_SYS_ADMIN`)的硬限制**:dockerd 可以 `vfs` + `bridge=none` 模式啟動,但 Docker 註冊映像層時必須調用 `unshare(CLONE_NEWNS)`(安全隔離),缺該 capability 時 `docker pull` / `docker load` 會報 `failed to register layer: unshare: operation not permitted`。這是 Docker 上游設計([moby#22139](https://github.com/moby/moby/issues/22139)),無任何 daemon.json 選項可繞過 — 需要**宿主以特權模式(`--privileged`)運行容器**。安裝腳本會在此情境提前警告,`doctor` 會顯示 `unshare` / `Seccomp` / `CapEff` 精確狀態供判定。
+- **無特權容器(無 `CAP_SYS_ADMIN`)的硬限制**:dockerd 可以 `vfs` + `bridge=none` 模式啟動,但 Docker 註冊映像層時必須調用 `unshare(CLONE_NEWNS)`(安全隔離),缺該 capability 時 `docker pull` / `docker load` 會報 `failed to register layer: unshare: operation not permitted`。這是 Docker 上游設計([moby#22139](https://github.com/moby/moby/issues/22139)),無任何 daemon.json 選項可繞過。緩解方式依優先級:**①核心允許 unprivileged userns 時**,腳本自動以 user namespace 包裝模式啟動(見上節);**②宿主以特權模式(`--privileged`)運行容器**;③兩者皆不可行時只能換環境或改用無權限方案(如 uDocker/PROot)。安裝腳本會在此情境提前警告,`doctor` 會顯示 `unshare` / `user namespace` / `Seccomp` / `CapEff` / `userns 包裝模式` 精確狀態供判定。

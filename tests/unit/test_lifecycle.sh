@@ -125,3 +125,75 @@ test_do_start_cleans_dead_default_pidfile() {
   assert_not_contains "殘留死 pidfile 應被刪除" "99999999" "$(cat "$DSND_DOCKERD_DEFAULT_PIDFILE" 2>/dev/null || echo gone)"
   do_stop >/dev/null 2>&1 || true
 }
+
+# ── 任務 6:user namespace 包裝模式(繞過映像層註冊 EPERM)──
+
+test_do_start_no_wrap_when_direct_ok() {
+  _setup_fake
+  mkdir -p "$T/bin"
+  cat > "$T/bin/unshare" <<EOF
+#!/usr/bin/env bash
+echo "unshare \$*" >> "$T/unshare2.args"
+exec "\$@"
+EOF
+  chmod +x "$T/bin/unshare"
+  PATH="$T/bin:$PATH"
+  is_running() { return 1; }
+  userns_wrap_needed() { return 1; }
+  wait_daemon_ready() { return 0; }
+  rm -f "$DSND_PID_FILE" "$T/unshare2.args"
+  DSND_QUIET=1 do_start >/dev/null 2>&1
+  assert_eq "直接模式 do_start 應成功" "0" "$?"
+  if [[ ! -e "$T/unshare2.args" ]]; then
+    _t_assert; _t_pass
+  else
+    _t_fail "直接模式不應調用 unshare 包裝"
+  fi
+  do_stop >/dev/null 2>&1 || true
+  source "$SCRIPT_DIR/src/docker-nosystemd.sh"
+}
+
+test_do_start_wraps_dockerd_in_userns() {
+  _setup_fake
+  mkdir -p "$T/bin"
+  cat > "$T/bin/unshare" <<EOF
+#!/usr/bin/env bash
+echo "unshare \$*" >> "$T/unshare1.args"
+exec "\$@"
+EOF
+  chmod +x "$T/bin/unshare"
+  PATH="$T/bin:$PATH"
+  is_running() { return 1; }
+  userns_wrap_needed() { return 0; }
+  wait_daemon_ready() { return 0; }
+  rm -f "$DSND_PID_FILE" "$T/unshare1.args"
+  DSND_QUIET=1 do_start >/dev/null 2>&1
+  assert_eq "包裝模式 do_start 應成功" "0" "$?"
+  local _i=0
+  while [[ ! -s "$T/unshare1.args" && $_i -lt 50 ]]; do sleep 0.1; _i=$((_i + 1)); done
+  assert_contains "啟動命令應含 unshare -Ur" "-Ur" "$(cat "$T/unshare1.args" 2>/dev/null || echo MISSING)"
+  assert_contains "unshare 應包裹 dockerdbin" "$DSND_DOCKERD_BIN" "$(cat "$T/unshare1.args" 2>/dev/null || echo MISSING)"
+  do_stop >/dev/null 2>&1 || true
+  source "$SCRIPT_DIR/src/docker-nosystemd.sh"
+}
+
+test_userns_wrap_needed_matrix() {
+  probe_unshare_mount_ok() { return 1; }
+  probe_unshare_userns_ok() { return 0; }
+  DSND_USERNS_MODE=auto userns_wrap_needed; local rc=$?
+  assert_eq "auto:mount 拒+userns 可 → 需包裝" "0" "$rc"
+  DSND_USERNS_MODE=never userns_wrap_needed; rc=$?
+  assert_eq "never:恆不包裝" "1" "$rc"
+  DSND_USERNS_MODE=force userns_wrap_needed; rc=$?
+  assert_eq "force:userns 可 → 包裝" "0" "$rc"
+  probe_unshare_mount_ok() { return 0; }
+  DSND_USERNS_MODE=auto userns_wrap_needed; rc=$?
+  assert_eq "auto:mount 可 → 不包裝" "1" "$rc"
+  probe_unshare_mount_ok() { return 1; }
+  probe_unshare_userns_ok() { return 1; }
+  DSND_USERNS_MODE=auto userns_wrap_needed; rc=$?
+  assert_eq "auto:雙拒 → 不包裝(無法包)" "1" "$rc"
+  DSND_USERNS_MODE=force userns_wrap_needed; rc=$?
+  assert_eq "force:userns 拒 → 不包裝" "1" "$rc"
+  source "$SCRIPT_DIR/src/docker-nosystemd.sh"
+}
