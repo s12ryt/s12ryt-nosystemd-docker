@@ -1,0 +1,6 @@
+# 統一換行:bash 腳本必須 LF(WSL/Linux 執行),PowerShell 用 CRLF
+* text=auto
+*.sh text eol=lf
+install.sh text eol=lf
+*.md text eol=lf
+*.ps1 text eol=crlf
