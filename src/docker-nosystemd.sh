@@ -144,6 +144,15 @@ analyze_log_hint() {
     echo "unknown"
 }
 
+# 失敗時輸出 daemon 日誌尾部(省去手動找日誌),走 stderr 與錯誤訊息一致
+dump_log_tail() { # [lines]
+    local lines="${1:-20}"
+    local logfile="${DSND_LOG_FILE:-/var/log/docker-nosystemd.log}"
+    [[ -f "$logfile" ]] || return 0
+    printf '── dockerd 日誌(最後 %s 行,完整日誌:%s)──\n' "$lines" "$logfile" >&2
+    tail -n "$lines" "$logfile" >&2
+}
+
 # ═════════════════════ 環境探測 ═════════════════════
 
 probe_iptables_ok() {
@@ -156,6 +165,30 @@ probe_bridge_ok() {
     ip link add dsndprobe0 type bridge >/dev/null 2>&1 || return 1
     ip link del dsndprobe0 >/dev/null 2>&1 || true
     return 0
+}
+
+# cgroup 掛載檢測(無特權容器缺 cgroup 時 dockerd 無法啟動)
+probe_cgroup() {
+    local mounts="${DSND_PROC_MOUNTS:-/proc/mounts}"
+    [[ -f "$mounts" ]] || return 1
+    grep -q ' cgroup2\? ' "$mounts" 2>/dev/null
+}
+
+# 輸出 v2|v1|none(v2 優先判定)
+cgroup_flavor() {
+    local mounts="${DSND_PROC_MOUNTS:-/proc/mounts}"
+    if [[ -f "$mounts" ]]; then
+        grep -q ' cgroup2 ' "$mounts" 2>/dev/null && { echo "v2"; return 0; }
+        grep -q ' cgroup ' "$mounts" 2>/dev/null && { echo "v1"; return 0; }
+    fi
+    echo "none"
+}
+
+# 核心是否支援 overlay 檔案系統(不支援則只能用 vfs)
+probe_overlay_fs() {
+    local fsfiles="${DSND_PROC_FILESYSTEMS:-/proc/filesystems}"
+    [[ -f "$fsfiles" ]] || return 1
+    grep -qw overlay "$fsfiles" 2>/dev/null
 }
 
 netmode_iptables() { case "$1" in full) echo 1 ;; *) echo 0 ;; esac; }
@@ -359,8 +392,25 @@ require_root() {
     return 0
 }
 
+# 偵測 Docker apt 倉庫是否已配置(docker.list / docker.sources / 任何含
+# download.docker.com 的來源)— 避免重複配置造成 apt 警告
+docker_apt_repo_configured() {
+    local dir="${DSND_APT_SOURCES_DIR:-/etc/apt/sources.list.d}"
+    local main_list="${DSND_APT_SOURCES_LIST:-/etc/apt/sources.list}"
+    if [[ -f "$dir/docker.list" || -f "$dir/docker.sources" ]]; then
+        return 0
+    fi
+    grep -rh 'download\.docker\.com' "$main_list" "$dir" 2>/dev/null | grep -q .
+}
+
 setup_docker_apt_repo() { # distro(debian|ubuntu)
     local distro="$1" codename
+    local sources_dir="${DSND_APT_SOURCES_DIR:-/etc/apt/sources.list.d}"
+    if docker_apt_repo_configured; then
+        log "偵測到既有 Docker apt 倉庫配置,跳過重複添加"
+        apt-get update -y >/dev/null 2>&1 || true
+        return 0
+    fi
     # shellcheck disable=SC1091
     codename="$(. /etc/os-release && echo "${VERSION_CODENAME:-}")"
     [[ -n "$codename" ]] || return 1
@@ -370,7 +420,7 @@ setup_docker_apt_repo() { # distro(debian|ubuntu)
     curl -fsSL "https://download.docker.com/linux/$distro/gpg" -o /etc/apt/keyrings/docker.asc || return 1
     chmod a+r /etc/apt/keyrings/docker.asc
     echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/$distro $codename stable" \
-        > /etc/apt/sources.list.d/docker.list
+        > "$sources_dir/docker.list"
     apt-get update -y || return 1
 }
 
@@ -474,7 +524,11 @@ provision_with_fallback() {
         fi
         attempt=$((attempt + 1))
     done
-    die "dockerd 在所有降級組合下均啟動失敗,請執行 docker-nosystemd doctor 診斷,並查看 ${DSND_LOG_FILE:-/var/log/docker-nosystemd.log}"
+    if ! probe_cgroup; then
+        warn "偵測到 cgroup 未掛載:無特權容器通常無法運行 dockerd(需宿主提供 cgroup 掛載或特權模式)"
+    fi
+    dump_log_tail 25
+    die "dockerd 在所有降級組合下均啟動失敗,請執行 docker-nosystemd doctor 診斷"
 }
 
 do_install() {
@@ -545,6 +599,14 @@ do_doctor() {
     fi
     printf 'iptables 可用 : %s\n' "$(probe_iptables_ok && echo '是' || echo '否(將降級 iptables=false)')"
     printf 'bridge 可用   : %s\n' "$(probe_bridge_ok && echo '是' || echo '否(將降級 bridge=none)')"
+    local cg
+    cg="$(cgroup_flavor)"
+    case "$cg" in
+        v2) printf 'cgroup 掛載   : 是(v2 unified)\n' ;;
+        v1) printf 'cgroup 掛載   : 是(v1)\n' ;;
+        *) printf 'cgroup 掛載   : 否(無特權容器將無法運行 dockerd)\n' ;;
+    esac
+    printf 'overlay 支援  : %s\n' "$(probe_overlay_fs && echo '是' || echo '否(將使用 vfs)')"
     printf 'daemon 狀態   : %s\n' "$(is_running && echo "運行中(PID $(cat "${DSND_PID_FILE:-/var/run/docker-nosystemd.pid}"))" || echo '未運行')"
     if is_running && command -v docker >/dev/null 2>&1; then
         printf 'docker info   : %s\n' "$(docker info >/dev/null 2>&1 && echo '正常' || echo '異常')"
