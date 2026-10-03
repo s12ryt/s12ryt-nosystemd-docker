@@ -61,3 +61,73 @@ test_dump_log_tail_no_file_silent() {
   assert_eq "日誌不存在應返回 0" "0" "$rc"
   assert_eq "日誌不存在應無輸出" "" "$out"
 }
+
+# ---------- unshare / proc status(任務 5:映像層註冊 EPERM 診斷)----------
+
+_make_stub_bin() { # <dir> <name> <exit-code>
+  mkdir -p "$1"
+  printf '#!/bin/sh\nexit %s\n' "$3" > "$1/$2"
+  chmod +x "$1/$2"
+}
+
+test_probe_unshare_mount_ok_allowed() {
+  _make_stub_bin "$T/bin-nsok" unshare 0
+  PATH="$T/bin-nsok:$PATH"
+  if probe_unshare_mount_ok; then _t_assert; _t_pass; else _t_assert; _t_fail "unshare -m 允許應判定可用"; fi
+}
+
+test_probe_unshare_mount_ok_denied() {
+  _make_stub_bin "$T/bin-nsdeny" unshare 1
+  PATH="$T/bin-nsdeny:$PATH"
+  if probe_unshare_mount_ok; then _t_assert; _t_fail "unshare -m 被拒應判定不可用"; else _t_assert; _t_pass; fi
+}
+
+test_probe_unshare_userns_ok_allowed() {
+  _make_stub_bin "$T/bin-uok" unshare 0
+  PATH="$T/bin-uok:$PATH"
+  if probe_unshare_userns_ok; then _t_assert; _t_pass; else _t_assert; _t_fail "unshare -U 允許應判定可用"; fi
+}
+
+test_probe_unshare_userns_ok_denied() {
+  _make_stub_bin "$T/bin-udeny" unshare 1
+  PATH="$T/bin-udeny:$PATH"
+  if probe_unshare_userns_ok; then _t_assert; _t_fail "unshare -U 被拒應判定不可用"; else _t_assert; _t_pass; fi
+}
+
+test_probe_unshare_missing_binary() {
+  local saved_path="$PATH"
+  mkdir -p "$T/bin-empty"
+  PATH="$T/bin-empty"
+  if probe_unshare_mount_ok; then _t_assert; _t_fail "無 unshare 命令應判定不可用且不炸"; else _t_assert; _t_pass; fi
+  PATH="$saved_path"
+}
+
+test_proc_status_field_parses_values() {
+  printf 'Name:\tbash\nSeccomp:\t2\nCapEff:\t00000000a80425fb\n' > "$T/self-status"
+  DSND_PROC_STATUS="$T/self-status"
+  assert_eq "應解析 Seccomp 欄位" "2" "$(proc_status_field Seccomp)"
+  assert_eq "應解析 CapEff 欄位" "00000000a80425fb" "$(proc_status_field CapEff)"
+}
+
+test_proc_status_field_missing() {
+  printf 'Name:\tbash\n' > "$T/self-status-min"
+  DSND_PROC_STATUS="$T/self-status-min"
+  local v rc=0
+  v="$(proc_status_field Seccomp)" || rc=$?
+  assert_eq "欄位不存在應返回非零" "1" "$rc"
+  assert_eq "欄位不存在應無值" "" "$v"
+}
+
+test_doctor_mentions_unshare_seccomp_capeff() {
+  _make_stub_bin "$T/bin-doc" unshare 0
+  PATH="$T/bin-doc:$PATH"
+  printf 'Seccomp:\t2\nCapEff:\t00000000a80425fb\n' > "$T/status-doc"
+  DSND_PROC_STATUS="$T/status-doc"
+  DSND_PID_FILE="$T/none.pid"
+  local out
+  out="$(do_doctor 2>&1)" || true
+  assert_contains "doctor 應顯示 unshare 掛載ns 探測" "unshare" "$out"
+  assert_contains "doctor 應顯示 user namespace 探測" "user namespace" "$out"
+  assert_contains "doctor 應顯示 Seccomp 狀態" "Seccomp" "$out"
+  assert_contains "doctor 應顯示 CapEff 內容" "CapEff" "$out"
+}

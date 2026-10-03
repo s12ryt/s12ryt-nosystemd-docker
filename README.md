@@ -90,7 +90,7 @@ DSND_FORCE_INSTALL=1                       # 強制重裝 engine
 ## 測試
 
 ```bash
-bash tests/run-tests.sh              # 單元測試(bash mini 框架,72 斷言)
+bash tests/run-tests.sh              # 單元測試(bash mini 框架,120 斷言)
 bash tests/run-tests.sh && shellcheck install.sh src/docker-nosystemd.sh
 bash tests/integration/test_install_debian.sh   # 需 root + 無 systemd 的 Debian
 ```
@@ -103,3 +103,4 @@ bash tests/integration/test_install_debian.sh   # 需 root + 無 systemd 的 Deb
 - Alpine 路徑已實作並通過單元測試,但未實機驗證。
 - 極舊核心連 `vfs` 存儲都無法掛載時,腳本會明確報錯退出(不做進一步降級)。
 - `rc.local` 自啟依賴容器內存在 init 進程;純 `profile.d` 注入在無 init 容器仍有效(首個登入時啟動)。
+- **無特權容器(無 `CAP_SYS_ADMIN`)的硬限制**:dockerd 可以 `vfs` + `bridge=none` 模式啟動,但 Docker 註冊映像層時必須調用 `unshare(CLONE_NEWNS)`(安全隔離),缺該 capability 時 `docker pull` / `docker load` 會報 `failed to register layer: unshare: operation not permitted`。這是 Docker 上游設計([moby#22139](https://github.com/moby/moby/issues/22139)),無任何 daemon.json 選項可繞過 — 需要**宿主以特權模式(`--privileged`)運行容器**。安裝腳本會在此情境提前警告,`doctor` 會顯示 `unshare` / `Seccomp` / `CapEff` 精確狀態供判定。

@@ -118,3 +118,29 @@ test_doctor_mentions_overlay_mount_probe() {
   out="$(do_doctor 2>&1)" || true
   assert_contains "doctor 應顯示 overlay 掛載實測結果" "overlay 掛載實測" "$out"
 }
+
+# ---------- 任務 5:dockerd 起了但映像層註冊會 EPERM 的提前警告 ----------
+
+test_provision_warns_when_unshare_unavailable() {
+  _setup_provision_stubs
+  DSND_FORCE_NET_MODE="none"
+  DSND_FORCE_STORAGE="vfs"
+  probe_unshare_mount_ok() { return 1; }
+  do_start() { return 0; }
+  local rc=0 out
+  out="$(provision_with_fallback 2>&1)" || rc=$?
+  assert_eq "vfs/none 一輪成功 provision 應成功" "0" "$rc"
+  assert_contains "dockerd 起來但 unshare 不可用時應警告映像層註冊失敗" "register layer" "$out"
+}
+
+test_provision_silent_when_unshare_available() {
+  _setup_provision_stubs
+  DSND_FORCE_NET_MODE="none"
+  DSND_FORCE_STORAGE="vfs"
+  probe_unshare_mount_ok() { return 0; }
+  do_start() { return 0; }
+  local rc=0 out
+  out="$(provision_with_fallback 2>&1)" || rc=$?
+  assert_eq "provision 應成功" "0" "$rc"
+  assert_not_contains "unshare 可用時不應出現註冊失敗警告" "register layer" "$out"
+}

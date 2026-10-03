@@ -34,6 +34,7 @@ set -u
 # DSND_INIT_PROBE_ROOT / DSND_FORCE_NO_SYSTEMD(測試 init 偵測)
 # DSND_FORCE_NET_MODE   full|noiptables|none(強制網路模式,跳過探測)
 # DSND_FORCE_STORAGE    overlay2|vfs(強制存儲驅動)
+# DSND_PROC_STATUS      /proc/self/status 替代路徑(測試用)
 # DSND_FORCE_INSTALL   =1 強制重裝(即使 dockerd 已存在)
 
 AUTOSTART_BEGIN="# BEGIN docker-nosystemd autostart"
@@ -204,6 +205,27 @@ probe_overlay_mount_ok() {
     umount "$d/m" >/dev/null 2>&1 || true
     rm -rf "$d"
     return 0
+}
+
+# unshare(CLONE_NEWNS) 探測:Docker 註冊映像層(chrootarchive 解壓安全隔離)必需,
+# 需要 CAP_SYS_ADMIN;無特權容器被拒 → docker pull/load 報
+# "failed to register layer: unshare: operation not permitted"
+probe_unshare_mount_ok() {
+    command -v unshare >/dev/null 2>&1 || return 1
+    unshare -m true >/dev/null 2>&1
+}
+
+# unprivileged user namespace 探測(rootless 運行模式的必要條件)
+probe_unshare_userns_ok() {
+    command -v unshare >/dev/null 2>&1 || return 1
+    unshare -U true >/dev/null 2>&1
+}
+
+# 讀 /proc/self/status 指定欄位值(如 Seccomp / CapEff);檔案或欄位不存在返回 1
+proc_status_field() { # <欄位名> 例:Seccomp
+    local f="${DSND_PROC_STATUS:-/proc/self/status}"
+    [[ -f "$f" ]] || return 1
+    awk -v k="$1:" '$1 == k { print $2; found = 1; exit } END { exit found ? 0 : 1 }' "$f" 2>/dev/null
 }
 
 netmode_iptables() { case "$1" in full) echo 1 ;; *) echo 0 ;; esac; }
@@ -537,6 +559,12 @@ provision_with_fallback() {
             DSND_STORAGE_RESULT="$storage"
             [[ "$net" != "full" ]] && warn "已降級網路模式:$net(端口映射不可用;Cloudflare Tunnel 不受影響)"
             [[ "$storage" == "vfs" ]] && warn "存儲驅動降級為 vfs(效能較低,但相容性最好)"
+            # dockerd 起來 ≠ 可用:映像層註冊需要 unshare(CLONE_NEWNS);
+            # 無 CAP_SYS_ADMIN 的容器會在 pull/load 時才爆 EPERM,提前點破
+            if ! probe_unshare_mount_ok; then
+                warn "unshare(CLONE_NEWNS)不可用:dockerd 已啟動,但拉取/載入映像會失敗"
+                warn "(failed to register layer: unshare: operation not permitted)。此容器缺少 CAP_SYS_ADMIN,需要宿主以特權模式運行容器才能完整使用 Docker"
+            fi
             return 0
         fi
         # 記住本輪剛嘗試過的組合,再計算降級目標
@@ -639,6 +667,24 @@ do_doctor() {
     esac
     printf 'overlay 支援  : %s\n' "$(probe_overlay_fs && echo '是' || echo '否(將使用 vfs)')"
     printf 'overlay 掛載實測: %s\n' "$(probe_overlay_mount_ok && echo '是' || echo '否(核心支援但掛載被拒,將使用 vfs;常見於無特權容器)')"
+    local sec cap sec_desc cap_desc
+    sec="$(proc_status_field Seccomp || true)"
+    case "$sec" in
+        0) sec_desc="0(禁用)" ;;
+        1) sec_desc="1(strict)" ;;
+        2) sec_desc="2(過濾模式,系統調用可能受限)" ;;
+        *) sec_desc="未知" ;;
+    esac
+    cap="$(proc_status_field CapEff || true)"
+    if [[ "$cap" =~ ^0+$ ]]; then
+        cap_desc="${cap:-未知}(無任何 capability)"
+    else
+        cap_desc="${cap:-未知}"
+    fi
+    printf 'unshare 掛載ns: %s\n' "$(probe_unshare_mount_ok && echo '是' || echo '否(缺 CAP_SYS_ADMIN:映像層註冊將失敗,需宿主開特權)')"
+    printf 'user namespace: %s\n' "$(probe_unshare_userns_ok && echo '是' || echo '否(rootless 模式不可用)')"
+    printf 'Seccomp       : %s\n' "$sec_desc"
+    printf 'CapEff        : %s\n' "$cap_desc"
     printf 'daemon 狀態   : %s\n' "$(is_running && echo "運行中(PID $(cat "${DSND_PID_FILE:-/var/run/docker-nosystemd.pid}"))" || echo '未運行')"
     if is_running && command -v docker >/dev/null 2>&1; then
         printf 'docker info   : %s\n' "$(docker info >/dev/null 2>&1 && echo '正常' || echo '異常')"
