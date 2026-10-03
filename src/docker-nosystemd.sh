@@ -191,6 +191,21 @@ probe_overlay_fs() {
     grep -qw overlay "$fsfiles" 2>/dev/null
 }
 
+# overlay 實際掛載實測:無特權容器核心支援(/proc/filesystems 有 overlay)但掛載會 EPERM,
+# 只有實測才能分辨;探測用臨時目錄,結束即清理
+probe_overlay_mount_ok() {
+    local d
+    d="$(mktemp -d 2>/dev/null)" || return 1
+    mkdir -p "$d/l" "$d/w" "$d/u" "$d/m" 2>/dev/null || { rm -rf "$d"; return 1; }
+    if ! mount -t overlay dsndprobe -o "lowerdir=$d/l,upperdir=$d/w,workdir=$d/u" "$d/m" >/dev/null 2>&1; then
+        rm -rf "$d"
+        return 1
+    fi
+    umount "$d/m" >/dev/null 2>&1 || true
+    rm -rf "$d"
+    return 0
+}
+
 netmode_iptables() { case "$1" in full) echo 1 ;; *) echo 0 ;; esac; }
 netmode_bridge() { case "$1" in full | noiptables) echo 1 ;; *) echo 0 ;; esac; }
 next_net_mode() {
@@ -499,8 +514,19 @@ provision_with_fallback() {
             net="none"
         fi
     fi
-    local storage="${DSND_FORCE_STORAGE:-overlay2}"
+    # 起始存儲驅動:核心支援 + 實測掛載成功才用 overlay2;
+    # 無特權容器掛載會 EPERM,直接以 vfs 起始省一輪失敗(DSND_FORCE_STORAGE 可覆蓋)
+    local storage="${DSND_FORCE_STORAGE:-}"
+    if [[ -z "$storage" ]]; then
+        if probe_overlay_fs && probe_overlay_mount_ok; then
+            storage="overlay2"
+        else
+            storage="vfs"
+            warn "overlay 不可用(核心不支援或無掛載權限),存儲驅動直接使用 vfs"
+        fi
+    fi
     local attempt=0
+    local prev_net prev_storage
     while ((attempt < 4)); do
         log "嘗試啟動 dockerd(網路模式:$net / 存儲:$storage)"
         write_daemon_config "$(netmode_iptables "$net")" "$(netmode_bridge "$net")" "$storage"
@@ -513,13 +539,18 @@ provision_with_fallback() {
             [[ "$storage" == "vfs" ]] && warn "存儲驅動降級為 vfs(效能較低,但相容性最好)"
             return 0
         fi
+        # 記住本輪剛嘗試過的組合,再計算降級目標
+        prev_net="$net"
+        prev_storage="$storage"
         local hint
         hint="$(analyze_log_hint)"
         case "$hint" in
             storage) storage="vfs" ;;
             *) net="$(next_net_mode "$net")" ;;
         esac
-        if [[ "$net" == "none" && "$storage" == "vfs" ]]; then
+        # 只有「降級前後組合不變」= 本輪已是 none/vfs 且剛試過,才允許放棄;
+        # 直接檢查新組合會導致 vfs 輪從未執行(無特權容器 net 起始即 none 時必現)
+        if [[ "$net" == "$prev_net" && "$storage" == "$prev_storage" ]]; then
             break
         fi
         attempt=$((attempt + 1))
@@ -607,6 +638,7 @@ do_doctor() {
         *) printf 'cgroup 掛載   : 否(無特權容器將無法運行 dockerd)\n' ;;
     esac
     printf 'overlay 支援  : %s\n' "$(probe_overlay_fs && echo '是' || echo '否(將使用 vfs)')"
+    printf 'overlay 掛載實測: %s\n' "$(probe_overlay_mount_ok && echo '是' || echo '否(核心支援但掛載被拒,將使用 vfs;常見於無特權容器)')"
     printf 'daemon 狀態   : %s\n' "$(is_running && echo "運行中(PID $(cat "${DSND_PID_FILE:-/var/run/docker-nosystemd.pid}"))" || echo '未運行')"
     if is_running && command -v docker >/dev/null 2>&1; then
         printf 'docker info   : %s\n' "$(docker info >/dev/null 2>&1 && echo '正常' || echo '異常')"
