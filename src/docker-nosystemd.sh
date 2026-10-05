@@ -701,7 +701,7 @@ install_scrub_tools() {
         aarch64 | arm64) arch="arm64" ;;
         *) warn "dsnd-scrub 未支援此架構($(uname -m)),跳過 scrub 工具部署"; return 1 ;;
     esac
-    local base_url="${DSND_SCRUB_URL:-https://github.com/s12ryt/s12ryt-nosystemd-docker/releases/download/v1.1.0-scrub}"
+    local base_url="${DSND_SCRUB_URL:-https://github.com/s12ryt/s12ryt-nosystemd-docker/releases/download/v1.1.1-scrub}"
     local scrubbin="${DSND_SCRUB_BIN:-$bindir/dsnd-scrub}"
     mkdir -p "$bindir"
     if curl -fsSL -o "$scrubbin" "$base_url/dsnd-scrub-linux-$arch"; then

@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -311,5 +312,136 @@ func TestScrubFileRejectsBadInput(t *testing.T) {
 	}
 	if err := scrubFile(yesTar, filepath.Join(dir, "o2.tar")); err == nil {
 		t.Error("expected error for tar without index.json")
+	}
+}
+
+// TestScrubFileLegacySkopeoArchive: skopeo copy docker-archive 產出為 legacy
+// docker-save 格式(manifest.json 陣列 + <digest>.tar 層 + <digest>.json config
+// + <image-id>/ 目錄 + repositories),無 index.json。scrubFile 應辨識並清洗。
+func TestScrubFileLegacySkopeoArchive(t *testing.T) {
+	dir := t.TempDir()
+	layer := buildLayer([]ent{
+		{"home/", 65534, 65534, tar.TypeDir, ""},
+		{"etc/shadow", 0, 42, tar.TypeReg, "x"},
+		{"srv/app.txt", 1000, 1000, tar.TypeReg, "app"},
+	})
+	layHex := sha(layer)
+	cfg := map[string]any{
+		"architecture": "amd64",
+		"os":           "linux",
+		"rootfs":       map[string]any{"type": "layers", "diff_ids": []string{"sha256:" + layHex}},
+	}
+	cfgRaw, _ := json.Marshal(cfg)
+	cfgHex := sha(cfgRaw)
+	imgID := "b4c78c82deadbeefcafe0000000000000000000000000000000000000000ffff"
+	manifest := []map[string]any{{
+		"Config":   cfgHex + ".json",
+		"RepoTags": []string{"docker.io/library/busybox:latest"},
+		"Layers":   []string{layHex + ".tar"},
+	}}
+	mfRaw, _ := json.Marshal(manifest)
+	repos := map[string]any{"docker.io/library/busybox": map[string]any{"latest": imgID}}
+	reposRaw, _ := json.Marshal(repos)
+
+	buildTar := func(members [][2]any, symlink map[string]string) []byte {
+		var buf bytes.Buffer
+		tw := tar.NewWriter(&buf)
+		for _, m := range members {
+			name := m[0].(string)
+			data := m[1].([]byte)
+			_ = tw.WriteHeader(&tar.Header{Name: name, Mode: 0o644, Size: int64(len(data)), Format: tar.FormatGNU})
+			_, _ = tw.Write(data)
+		}
+		for name, target := range symlink {
+			_ = tw.WriteHeader(&tar.Header{Name: name, Mode: 0o777, Linkname: target, Typeflag: tar.TypeSymlink, Format: tar.FormatGNU})
+		}
+		_ = tw.Close()
+		return buf.Bytes()
+	}
+	src := filepath.Join(dir, "skopeo.tar")
+	os.WriteFile(src, buildTar([][2]any{
+		{layHex + ".tar", layer},
+		{cfgHex + ".json", cfgRaw},
+		{imgID + "/VERSION", []byte("1.0")},
+		{imgID + "/json", []byte(`{"id":"old"}`)},
+		{"manifest.json", mfRaw},
+		{"repositories", reposRaw},
+	}, map[string]string{imgID + "/layer.tar": "../" + layHex + ".tar"}), 0o644)
+
+	dst := filepath.Join(dir, "out.tar")
+	if err := scrubFile(src, dst); err != nil {
+		t.Fatalf("scrubFile legacy failed: %v", err)
+	}
+	out, _ := os.ReadFile(dst)
+	members, mErr := readMembers(bytes.NewReader(out))
+	if mErr != nil {
+		t.Fatalf("read output archive: %v", mErr)
+	}
+
+	// 找新層(檔名 .tar 結尾且非 manifest)
+	var newLayName, newCfgName string
+	for name := range members {
+		if strings.HasSuffix(name, ".tar") && name != "manifest.json" {
+			newLayName = name
+		}
+		if strings.HasSuffix(name, ".json") && name != "manifest.json" {
+			newCfgName = name
+		}
+	}
+	if newLayName == "" || newCfgName == "" {
+		t.Fatalf("output missing layer or config, got %d members", len(members))
+	}
+	// 舊檔消失 + <image-id>/ 與 repositories 丟棄
+	if _, ok := members[layHex+".tar"]; ok {
+		t.Error("old layer file still present")
+	}
+	if _, ok := members[cfgHex+".json"]; ok {
+		t.Error("old config file still present")
+	}
+	for name := range members {
+		if strings.HasPrefix(name, imgID+"/") {
+			t.Errorf("legacy image-id dir member should be dropped: %s", name)
+		}
+	}
+	if _, ok := members["repositories"]; ok {
+		t.Error("repositories should be dropped")
+	}
+	// 檔名 == 新 digest
+	newLay := members[newLayName]
+	if got := sha(newLay); newLayName != got+".tar" {
+		t.Errorf("layer filename %s != digest %s", newLayName, got)
+	}
+	entries := layerEntries(t, newLay)
+	for n, ug := range entries {
+		if ug[0] != 0 || ug[1] != 0 {
+			t.Errorf("layer entry %s uid/gid = %d/%d, want 0/0", n, ug[0], ug[1])
+		}
+	}
+	// config diff_ids 更新 + 檔名自洽
+	newCfg := members[newCfgName]
+	var c2 map[string]any
+	if err := json.Unmarshal(newCfg, &c2); err != nil {
+		t.Fatalf("config not json: %v", err)
+	}
+	diffs := c2["rootfs"].(map[string]any)["diff_ids"].([]any)
+	if diffs[0] != "sha256:"+sha(newLay) {
+		t.Errorf("diff_ids[0] = %v, want sha256:%s", diffs[0], sha(newLay))
+	}
+	if newCfgName != sha(newCfg)+".json" {
+		t.Errorf("config filename %s != digest %s", newCfgName, sha(newCfg))
+	}
+	// manifest.json 指向新檔 + 陣列合法
+	var mf []map[string]any
+	if err := json.Unmarshal(members["manifest.json"], &mf); err != nil {
+		t.Fatalf("manifest.json not a json array: %v", err)
+	}
+	if mf[0]["Config"] != newCfgName {
+		t.Errorf("manifest Config = %v, want %s", mf[0]["Config"], newCfgName)
+	}
+	if layers := mf[0]["Layers"].([]any); layers[0] != newLayName {
+		t.Errorf("manifest Layers[0] = %v, want %s", layers[0], newLayName)
+	}
+	if tags := mf[0]["RepoTags"].([]any); tags[0] != "docker.io/library/busybox:latest" {
+		t.Errorf("RepoTags changed: %v", tags)
 	}
 }

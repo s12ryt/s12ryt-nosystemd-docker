@@ -44,6 +44,7 @@ test_install_scrub_tools_deploys() {
     apt-get() { echo "apt-get $*" >> "$T/apt.calls"; return 0; }
     uname() { echo x86_64; }
     DSND_BIN_DIR="$bindir" DSND_SCRUB_URL="https://example.com/dsnd-scrub-test" \
+        DSND_SKOPEO_BIN="$T/no-skopeo" \
         install_scrub_tools >/dev/null 2>&1
     assert_file_exists "應下載 dsnd-scrub 二進制" "$bindir/dsnd-scrub"
     assert_contains "URL 應含 amd64 架構" "dsnd-scrub-linux-amd64" "$(cat "$T/curl.calls")"

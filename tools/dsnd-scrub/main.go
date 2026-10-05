@@ -17,6 +17,87 @@ import (
 // scrubFile reads an OCI-layout docker-archive tar, zeroes uid/gid of every
 // entry in every layer, re-signs the digest chain (layer -> config diff_ids
 // -> manifest -> index -> legacy manifest.json) and writes a new archive.
+// scrubLegacyFile rewrites a skopeo-style docker-archive: manifest.json is a
+// JSON array of {Config, RepoTags, Layers}; config and layer blobs sit at the
+// archive root named by their sha256 (layers are uncompressed tars). Every
+// layer is zeroed and the digest chain re-signed (layer file name -> config
+// diff_ids -> config file name -> manifest.json entries). Legacy <image-id>/
+// dirs and repositories reference old digests and are dropped — docker load
+// only needs manifest.json + Config + Layers.
+func scrubLegacyFile(members map[string][]byte, mfRaw []byte, dst string) error {
+	var entries []map[string]any
+	if err := json.Unmarshal(mfRaw, &entries); err != nil {
+		return fmt.Errorf("parse manifest.json: %w", err)
+	}
+	if len(entries) == 0 {
+		return fmt.Errorf("manifest.json is empty")
+	}
+	for _, ent := range entries {
+		cfgName, _ := ent["Config"].(string)
+		if cfgName == "" {
+			return fmt.Errorf("manifest.json entry missing Config")
+		}
+		cfgRaw, ok := members[cfgName]
+		if !ok {
+			return fmt.Errorf("config %s not found in archive", cfgName)
+		}
+		var cfg map[string]any
+		if err := json.Unmarshal(cfgRaw, &cfg); err != nil {
+			return fmt.Errorf("parse config %s: %w", cfgName, err)
+		}
+		rootfs, _ := cfg["rootfs"].(map[string]any)
+		if rootfs == nil {
+			return fmt.Errorf("config %s has no rootfs", cfgName)
+		}
+		diffAny, _ := rootfs["diff_ids"].([]any)
+		layerNames, _ := ent["Layers"].([]any)
+		if len(layerNames) != len(diffAny) {
+			return fmt.Errorf("config %s: layers(%d) != diff_ids(%d)", cfgName, len(layerNames), len(diffAny))
+		}
+		newLayers := make([]any, 0, len(layerNames))
+		for i, ln := range layerNames {
+			layName, _ := ln.(string)
+			layRaw, ok := members[layName]
+			if !ok {
+				return fmt.Errorf("layer %s not found in archive", layName)
+			}
+			clean, err := cleanTar(layRaw)
+			if err != nil {
+				return fmt.Errorf("clean layer %s: %w", layName, err)
+			}
+			newHex := hashBytes(clean)
+			newName := newHex + ".tar"
+			members[newName] = clean
+			delete(members, layName)
+			diffAny[i] = "sha256:" + newHex
+			newLayers = append(newLayers, newName)
+		}
+		rootfs["diff_ids"] = diffAny
+		cfgOut, err := compactJSON(cfg)
+		if err != nil {
+			return fmt.Errorf("reencode config %s: %w", cfgName, err)
+		}
+		newCfgName := hashBytes(cfgOut) + ".json"
+		members[newCfgName] = cfgOut
+		delete(members, cfgName)
+		ent["Config"] = newCfgName
+		ent["Layers"] = newLayers
+	}
+	mfOut, err := compactJSON(entries)
+	if err != nil {
+		return fmt.Errorf("reencode manifest.json: %w", err)
+	}
+	members["manifest.json"] = mfOut
+	// Drop legacy <image-id>/ directory members and repositories — both
+	// reference pre-scrub digests and docker 29 load ignores them anyway.
+	for name := range members {
+		if strings.Contains(name, "/") || name == "repositories" {
+			delete(members, name)
+		}
+	}
+	return writeArchive(members, dst)
+}
+
 func scrubFile(src, dst string) error {
 	raw, err := os.ReadFile(src)
 	if err != nil {
@@ -28,6 +109,12 @@ func scrubFile(src, dst string) error {
 	}
 	idxRaw, ok := members["index.json"]
 	if !ok {
+		if mfRaw, has := members["manifest.json"]; has {
+			// skopeo docker-archive legacy layout: manifest.json array +
+			// <config-digest>.json + <layer-digest>.tar at archive root
+			// (no index.json / oci-layout / blobs/). Scrub it in place.
+			return scrubLegacyFile(members, mfRaw, dst)
+		}
 		return fmt.Errorf("invalid archive: index.json not found (not an OCI/docker-save tar?)")
 	}
 	var index map[string]any
