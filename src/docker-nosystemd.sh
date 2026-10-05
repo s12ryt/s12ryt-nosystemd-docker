@@ -753,6 +753,14 @@ WRAPPER
 # 鉤子:DSND_SKOPEO_BIN / DSND_SCRUB_BIN / DSND_DOCKER_BIN(默認 docker)
 do_scrub_pull() {
     local ref="${1:?用法:docker-nosystemd scrub-pull <image>[:tag]}"
+    # 補全 tag(docker pull busybox 等同 busybox:latest):ref 不帶 tag 時
+    # skopeo docker-archive 產出的 manifest.json RepoTags 為空 → docker load
+    # 後映像無 tag(僅 Loaded image ID),docker run <ref> 找不到本地映像
+    # 又觸發原生 pull 反而失敗。basename(最後 / 後)不含 : 且非 @digest 才補。
+    local _base="${ref##*/}"
+    if [[ "$_base" != *:* && "$ref" != *@* ]]; then
+        ref="${ref}:latest"
+    fi
     local scrubbin="${DSND_SCRUB_BIN:-/usr/local/bin/dsnd-scrub}"
     local skopeobin="${DSND_SKOPEO_BIN:-skopeo}"
     local dockerbin="${DSND_DOCKER_BIN:-docker}"
@@ -764,7 +772,11 @@ do_scrub_pull() {
     # shellcheck disable=SC2064 # trap 展開此刻的變量
     trap "rm -f '$tmp_raw' '$tmp_clean'" RETURN
     log "下載映像(不經 dockerd):$ref"
-    "$skopeobin" copy "docker://$ref" "docker-archive:$tmp_raw" || die "skopeo 下載失敗:$ref"
+    # docker-archive:file:repo:tag — 第三段 tag 讓 skopeo 把 RepoTags 寫進
+    # manifest.json(load 後映像帶 tag);@digest 引用無 tag 可寫,保持無 tag
+    local _dst="docker-archive:$tmp_raw"
+    [[ "$ref" != *@* ]] && _dst="$_dst:$ref"
+    "$skopeobin" copy "docker://$ref" "$_dst" || die "skopeo 下載失敗:$ref"
     log "清洗層 uid/gid → 0:0 並重簽 digest 鏈…"
     "$scrubbin" file "$tmp_raw" "$tmp_clean" || die "dsnd-scrub 清洗失敗"
     log "匯入本機 dockerd…"

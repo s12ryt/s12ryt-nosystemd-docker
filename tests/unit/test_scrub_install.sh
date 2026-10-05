@@ -76,7 +76,10 @@ test_scrub_pull_command() {
         echo "skopeo $*" >> "$T/skopeo.calls"
         local args=("$@") i out=""
         for ((i = 0; i < $#; i++)); do
-            [[ "${args[$i]}" == docker-archive:* ]] && out="${args[$i]#docker-archive:}"
+            if [[ "${args[$i]}" == docker-archive:* ]]; then
+                out="${args[$i]#docker-archive:}"
+                out="${out%%:*}" # docker-archive:file[:repo[:tag]] — 檔名到第一個冒號
+            fi
         done
         [[ -n "$out" ]] && printf 'faketar' > "$out"
         return 0
@@ -89,6 +92,10 @@ test_scrub_pull_command() {
     assert_contains "skopeo 應拉 docker://busybox:latest" "docker://busybox:latest" "$(cat "$T/skopeo.calls")"
     assert_contains "應執行 docker load" "load" "$(cat "$T/docker.calls")"
     assert_contains "應調 dsnd-scrub file" "file" "$(cat "$T/scrub.calls")"
+    : > "$T/skopeo.calls"
+    DSND_SCRUB_BIN="$scrubbin" do_scrub_pull busybox >/dev/null 2>&1
+    assert_contains "無 tag ref 應補 :latest(docker pull 語義)" "docker://busybox:latest" "$(cat "$T/skopeo.calls")"
+    assert_contains "docker-archive 應帶 tag 參數(否則 load 後映像無 RepoTags)" ":busybox:latest" "$(cat "$T/skopeo.calls")"
     _clear_overrides
 }
 
