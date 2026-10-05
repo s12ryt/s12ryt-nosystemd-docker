@@ -86,10 +86,82 @@ test_scrub_run_missing_image_fails() {
     _clear_overrides
 }
 
+test_scrub_run_env_option() {
+    _clear_overrides
+    _setup_run_stubs
+    chroot() {
+        echo "chroot $* FOO=${FOO:-unset}" >> "$T/chroot.calls"
+        return 0
+    }
+    export DSND_CHROOT_ROOT="$T/chroots-env"
+    do_scrub_run -e FOO=bar busybox:latest env >/dev/null 2>&1
+    assert_contains "-e 應注入環境變數" "FOO=bar" "$(cat "$T/chroot.calls")"
+    unset DSND_CHROOT_ROOT FOO
+    _clear_overrides
+}
+
+test_scrub_run_volume_option() {
+    _clear_overrides
+    _setup_run_stubs
+    mkdir -p "$T/hostdata"
+    echo snapshot-content > "$T/hostdata/file.txt"
+    export DSND_CHROOT_ROOT="$T/chroots-vol"
+    do_scrub_run -v "$T/hostdata:/data" busybox:latest cat /data/file.txt >/dev/null 2>&1
+    assert_file_exists "-v 應快照複製 host 檔案到 rootfs" "$T/chroots-vol/busybox_latest/data/file.txt"
+    unset DSND_CHROOT_ROOT
+    _clear_overrides
+}
+
+test_scrub_run_detach() {
+    _clear_overrides
+    _setup_run_stubs
+    export DSND_CHROOT_ROOT="$T/chroots-d"
+    export DSND_CHROOT_LOG="$T/detach.log"
+    do_scrub_run -d busybox:latest true >/dev/null 2>&1
+    local rc=$?
+    assert_eq "-d 應立即返回 0" 0 "$rc"
+    assert_file_exists "-d 應寫背景日誌" "$T/detach.log"
+    unset DSND_CHROOT_ROOT DSND_CHROOT_LOG
+    _clear_overrides
+}
+
+test_scrub_run_workdir() {
+    _clear_overrides
+    _setup_run_stubs
+    export DSND_CHROOT_ROOT="$T/chroots-w"
+    do_scrub_run -w /srv busybox:latest worker >/dev/null 2>&1
+    assert_contains "-w 應以 sh -c cd 組裝" 'cd "$0"' "$(cat "$T/chroot.calls")"
+    unset DSND_CHROOT_ROOT
+    _clear_overrides
+}
+
+test_scrub_run_entrypoint() {
+    _clear_overrides
+    _setup_run_stubs
+    export DSND_CHROOT_ROOT="$T/chroots-ep"
+    do_scrub_run --entrypoint /bin/echo busybox:latest hi >/dev/null 2>&1
+    assert_contains "--entrypoint 應組合為首參數" "/bin/echo hi" "$(cat "$T/chroot.calls")"
+    unset DSND_CHROOT_ROOT
+    _clear_overrides
+}
+
+test_scrub_run_ignores_common_flags() {
+    _clear_overrides
+    _setup_run_stubs
+    export DSND_CHROOT_ROOT="$T/chroots-ign"
+    do_scrub_run -it --name mybox -p 8080:80 busybox:latest true >/dev/null 2>&1
+    assert_contains "忽略旗標後仍應執行命令" "true" "$(cat "$T/chroot.calls")"
+    assert_contains "仍應 create 映像" "create busybox:latest" "$(cat "$T/docker.calls")"
+    unset DSND_CHROOT_ROOT
+    _clear_overrides
+}
+
 # ── runner ──
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
     for _t in test_scrub_run_executes_chroot test_scrub_run_rm_cleans_rootfs \
-        test_scrub_run_keeps_rootfs_without_rm test_scrub_run_missing_image_fails; do
+        test_scrub_run_keeps_rootfs_without_rm test_scrub_run_missing_image_fails \
+        test_scrub_run_env_option test_scrub_run_volume_option test_scrub_run_detach \
+        test_scrub_run_workdir test_scrub_run_entrypoint test_scrub_run_ignores_common_flags; do
         "$_t"
     done
     summary "test_scrub_run.sh"

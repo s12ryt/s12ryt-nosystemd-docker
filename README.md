@@ -55,7 +55,9 @@ sudo bash src/docker-nosystemd.sh install
 | `stop` | 停止 dockerd(TERM → 15s → KILL;冪等) | ✅ |
 | `restart` | 重啟 dockerd | ✅ |
 | `scrub-pull <image>` | 下載映像 → 層歸零重簽 → `docker load`(單映射環境的 pull 替代) | ❌ |
-| `run [--rm] <image> <cmd>` | `docker create` → `export` 解出 → `chroot` 執行(「窮人容器」,見 scrub 章節) | ✅ |
+| `run [--rm] <image> <cmd>` | `docker create` → `export` 解出 → `chroot` 執行(「窮人容器」,見 scrub 章節;支援 -e/-v/-d/-w/--entrypoint/--name 等 docker run 選項) | ✅ |
+| `ps` / `rm <name>` | chroot 容器列表 / 刪除(僅 -d 建立的持久容器) | ✅ |
+| `stop` / `logs` | 無參 = dockerd;帶容器名 = chroot 容器 | ✅ |
 | `status` | 查詢狀態(運行中返回 0,未運行返回 1) | ❌ |
 | `logs [N\|-f]` | 查看 dockerd 日誌(默認 50 行,`-f` 跟隨) | ❌ |
 | `doctor` | 環境診斷(不修改任何東西) | ❌ |
@@ -112,7 +114,7 @@ DSND_USERNS_MODE=auto|never|force          # dockerd 啟動包裝(見下節)
 ## 測試
 
 ```bash
-bash tests/run-tests.sh              # 單元測試(bash mini 框架,215 斷言;單文件逾時自動標記 TIMEOUT)
+bash tests/run-tests.sh              # 單元測試(bash mini 框架,227 斷言;單文件逾時自動標記 TIMEOUT)
 bash tests/run-tests.sh && shellcheck install.sh src/docker-nosystemd.sh
 bash tests/integration/test_install_debian.sh   # 需 root + 無 systemd 的 Debian
 ```
@@ -144,14 +146,18 @@ docker run --rm busybox:latest true   # 驗證
 
 ### `run` 子命令(chroot 執行,「窮人容器」)
 
-部分沙箱(如 K8s unprivileged pod)連 OCI runtime 都焊死 — cgroup 唯讀、mount syscall 被 seccomp 全擋、userns 映射寫入被拒,`docker run` 在 runc/crun 階段必死。只要 `chroot` 可用(CAP_SYS_CHROOT 是 Docker 默認 caps 之一),`run` 子命令提供最後一級執行:
+部分沙箱(如 K8s unprivileged pod)連 OCI runtime 都焊死 — cgroup 唯讀、mount syscall 被 seccomp 全擋、userns 映射寫入被拒,`docker run` 在 runc/crun 階段必死。只要 `chroot` 可用(CAP_SYS_CHROOT 是 Docker 默認 caps 之一),`run` 子命令提供最後一級執行,**`/usr/local/bin/docker` 包裝已自動把 `docker run` 攔截轉發到此**:
 
 ```bash
-docker-nosystemd run busybox:latest /bin/true     # create → export 解出 → chroot 執行
-docker-nosystemd run --rm busybox:latest sh -c 'echo hi'
+docker run --rm busybox:latest /bin/true        # 攔截 → chroot 執行
+docker run -d --name web -e PORT=8080 -v /data:/data nginx:latest nginx -g 'daemon off;'
+docker ps                                       # 列出 -d 建立的 chroot 容器
+docker logs web && docker stop web && docker rm web
 ```
 
-- 原理:`docker create` + `docker export` 把映像解出到 `/var/lib/dsnd-chroot/<image>`(可用 `DSND_CHROOT_ROOT` 覆蓋),再 `chroot` 進去執行指定命令;無 `--rm` 時 rootfs 保留(重跑同映像更快)
+- **選項支援**:`--rm`(跑完清 rootfs)/`-d` 後台(持久容器,記 PID 與日誌供 ps/logs/stop/rm 管理)/`-e VAR=VAL` 注入環境/`-v HOST:CONT`(**單向快照複製**,chroot 無法共享掛載;HOST 不存在自動建)/`-w` 工作目錄/`--entrypoint` 覆寫/`--name` 命名;`-i -t -p --network -u --restart` 等照 docker 語義忽略(無 ns 隔離,服務端口直接監聽 host 網路)
+- 無 `--name` 的 `-d` 自動命名 `dsnd-<時間戳>`;前台執行(無 `-d`)為臨時性質
+- **管理**:`docker-nosystemd ps / rm <name> / stop <name> / logs <name>`(`stop`/`logs` 無參時仍指 dockerd);docker 包裝攔截 `docker ps/rm/stop/logs` 同步轉發
 - **限制(誠實標註)**:無 namespace / cgroup 隔離、rootfs 內沒有 `/proc` — busybox 工具、腳本、靜態服務可用;讀 `/proc` 的複雜應用(部分 Go/nginx)可能不行
 
 ## 已知限制

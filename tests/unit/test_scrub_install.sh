@@ -136,12 +136,58 @@ test_install_scrub_stops_proxy_first() {
     unset DSND_BIN_DIR DSND_SCRUB_URL DSND_SKOPEO_BIN
 }
 
+# wrapper 應攔截 docker run/ps 原樣轉發 docker-nosystemd,其餘透傳真 docker
+test_wrapper_intercepts_run_and_ps() {
+    _clear_overrides
+    local W; W="$(t_tmpdir)"
+    mkdir -p "$W/dsndbin"
+    printf '#!/bin/bash\necho "dsnd $*" >> %s/dsnd.calls\n' "$W" > "$W/dsndbin/docker-nosystemd"
+    chmod +x "$W/dsndbin/docker-nosystemd"
+    printf '#!/bin/bash\necho "real $*" >> %s/real.calls\n' "$W" > "$W/real-docker"
+    chmod +x "$W/real-docker"
+    curl() {
+        local _out="" a
+        for a in "$@"; do
+            if [[ -n "${_expect_out:-}" && "$a" == "$_expect_out" ]]; then _out="$a"; fi
+        done
+        # 掃 -o 參數寫 stub elf
+        local args=("$@") i
+        for ((i = 0; i < $#; i++)); do
+            if [[ "${args[$i]}" == "-o" && -n "${args[$((i + 1))]:-}" ]]; then
+                printf '#!/bin/sh\n' > "${args[$((i + 1))]}"
+            fi
+        done
+        return 0
+    }
+    apt-get() { return 0; }
+    uname() { echo x86_64; }
+    proxy_stop() { return 0; }
+    export DSND_BIN_DIR="$W/bin"
+    export DSND_SCRUB_URL="https://example.com/dsnd-scrub-test"
+    export DSND_SKOPEO_BIN="$W/no-skopeo"
+    install_scrub_tools >/dev/null 2>&1 || true
+    # 部署後以運行時變量導向 stub,驗證攔截/透傳(wrapper 運行時讀這些變量)
+    export DSND_BIN_DIR="$W/dsndbin"
+    export DSND_REAL_DOCKER="$W/real-docker"
+    "$W/bin/docker" run -e A=b busybox:latest true >/dev/null 2>&1 || true
+    "$W/bin/docker" ps >/dev/null 2>&1 || true
+    "$W/bin/docker" version >/dev/null 2>&1 || true
+    assert_contains "run 應原樣轉發 docker-nosystemd(含全部選項)" "run -e A=b busybox:latest true" "$(cat "$W/dsnd.calls" 2>/dev/null)"
+    assert_contains "ps 應轉發 docker-nosystemd" "ps" "$(cat "$W/dsnd.calls" 2>/dev/null)"
+    assert_contains "非攔截命令應透傳真 docker" "real version" "$(cat "$W/real.calls" 2>/dev/null)"
+    local _leak
+    _leak="$(grep -c '^real run' "$W/real.calls" 2>/dev/null || true)"
+    assert_eq "run 不應透傳真 docker" "0" "${_leak:-0}"
+    _clear_overrides
+    unset DSND_BIN_DIR DSND_SCRUB_URL DSND_SKOPEO_BIN DSND_REAL_DOCKER
+}
+
 # ---------------------------------------------------------------
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
     for _t in test_scrub_needed_matrix test_install_scrub_tools_deploys \
         test_install_scrub_tools_skips_when_not_needed test_scrub_pull_command \
         test_scrub_pull_requires_bin test_doctor_mentions_scrub \
-        test_install_scrub_stops_proxy_first; do
+        test_install_scrub_stops_proxy_first test_wrapper_intercepts_run_and_ps; do
         "$_t"
     done
     summary "test_scrub_install.sh"

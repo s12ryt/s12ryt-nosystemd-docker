@@ -727,25 +727,47 @@ install_scrub_tools() {
             warn "找不到套件管理器安裝 skopeo;scrub-pull 將不可用"
         fi
     fi
-    # docker 包裝:僅攔 pull;本腳本內部以絕對路徑 /usr/bin/docker 呼叫避免遞迴
+    # docker 包裝:攔 pull/run/ps/rm/stop/logs 轉發 chroot 容器體系;
+    # 本腳本內部以絕對路徑 /usr/bin/docker 呼叫避免遞迴
     cat > "$bindir/docker" <<'WRAPPER'
 #!/bin/sh
 # BEGIN docker-nosystemd pull interceptor
-# 攔 `docker pull REF` 轉發映像清洗流程(單映射環境 Lchown EINVAL 的唯一解);
-# 其餘命令原樣透傳真實 docker CLI。
-REAL=/usr/bin/docker
-DSND=/usr/local/bin/docker-nosystemd
-SCRUB=/usr/local/bin/dsnd-scrub
-if [ "$1" = "pull" ] && [ -n "$2" ] && [ -z "$3" ] \
-    && [ -x "$SCRUB" ] && command -v skopeo >/dev/null 2>&1 \
-    && [ -x "$DSND" ]; then
-    exec "$DSND" scrub-pull "$2"
-fi
+# 攔 `docker pull REF`(轉發映像清洗)與 run/ps/rm/stop/logs(轉發 chroot
+# 容器體系);其餘命令原樣透傳真實 docker CLI。路徑可由環境變量覆蓋。
+REAL=${DSND_REAL_DOCKER:-/usr/bin/docker}
+DSND=${DSND_BIN_DIR:-/usr/local/bin}/docker-nosystemd
+SCRUB=${DSND_SCRUB_BIN:-/usr/local/bin/dsnd-scrub}
+[ -x "$DSND" ] || exec "$REAL" "$@"
+case "$1" in
+    pull)
+        if [ -n "$2" ] && [ -z "$3" ] && [ -x "$SCRUB" ] \
+            && command -v skopeo >/dev/null 2>&1; then
+            exec "$DSND" scrub-pull "$2"
+        fi
+        ;;
+    run|ps|rm)
+        exec "$DSND" "$@"
+        ;;
+    stop)
+        # 帶容器名 = chroot 容器;無參(dockerd 操作)透傳
+        if [ -n "$2" ]; then
+            exec "$DSND" "$@"
+        fi
+        ;;
+    logs)
+        # 帶非 -f/數字參數 = chroot 容器日誌;否則透傳(dockerd 日誌)
+        if [ -n "$2" ] && [ "$2" != "-f" ] && [ "$2" != "--follow" ]; then
+            case "$2" in
+                *[!0-9]*) exec "$DSND" "$@" ;;
+            esac
+        fi
+        ;;
+esac
 exec "$REAL" "$@"
 # END docker-nosystemd pull interceptor
 WRAPPER
     chmod +x "$bindir/docker"
-    log "docker 包裝已部署:$bindir/docker(docker pull 自動轉發 scrub 流程)"
+    log "docker 包裝已部署:$bindir/docker(pull 清洗轉發;run/ps/rm/stop/logs 轉發 chroot 容器體系)"
     log "注意:docker compose 內建的自動 pull 不經包裝;compose 環境請先 docker pull 各映像再 up"
 }
 
@@ -788,13 +810,44 @@ do_scrub_pull() {
 # 適用:沙箱連 OCI runtime rootless 都焊死(cgroup ro + mount seccomp)、
 # 但 chroot 可用的環境(如 K8s unprivileged pod)。無 ns/cgroup 隔離,
 # 無 /proc — busybox/腳本/靜態服務可用;讀 /proc 的複雜應用不行。
-# 鉤子:DSND_DOCKER_BIN / DSND_CHROOT_ROOT(默認 /var/lib/dsnd-chroot)
+# 支援 docker run 常用選項:-d/-e/--name/-v(快照複製)/-w/--entrypoint/--rm;
+# -i/-t/--network/--user/-p 等語義上無意義或天然成立者靜默忽略。
+# 鉤子:DSND_DOCKER_BIN / DSND_CHROOT_ROOT(默認 /var/lib/dsnd-chroot)/ DSND_CHROOT_LOG
 do_scrub_run() {
-    local rm_flag=0
-    if [[ "${1:-}" == "--rm" ]]; then rm_flag=1; shift; fi
-    local image="${1:?用法:docker-nosystemd run [--rm] <image> <cmd> [args...]}"
+    local rm_flag=0 detach=0 workdir="" entrypoint="" name=""
+    local -a envs=() vols=()
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --rm) rm_flag=1; shift ;;
+            -d|--detach) detach=1; shift ;;
+            -i|-t|-it|--interactive|--tty) shift ;; # stdio 已繼承
+            -e|--env) [[ $# -ge 2 ]] || die "-e 缺少值"; envs+=("$2"); shift 2 ;;
+            -e=*|--env=*) envs+=("${1#*=}"); shift ;;
+            --name) [[ $# -ge 2 ]] || die "--name 缺少值"; name="$2"; shift 2 ;;
+            --name=*) name="${1#*=}"; shift ;;
+            -v|--volume) [[ $# -ge 2 ]] || die "-v 缺少值"; vols+=("$2"); shift 2 ;;
+            -v=*|--volume=*) vols+=("${1#*=}"); shift ;;
+            -p|--publish) shift 2 ;; -p=*|--publish=*) shift ;;
+            -w|--workdir) [[ $# -ge 2 ]] || die "-w 缺少值"; workdir="$2"; shift 2 ;;
+            -w=*|--workdir=*) workdir="${1#*=}"; shift ;;
+            --entrypoint) [[ $# -ge 2 ]] || die "--entrypoint 缺少值"; entrypoint="$2"; shift 2 ;;
+            --entrypoint=*) entrypoint="${1#*=}"; shift ;;
+            -u|--user|--network|--net|--restart|-m|--memory|--cpus|--hostname|-h)
+                shift 2 ;;
+            --user=*|--network=*|--net=*|--restart=*|--memory=*|--cpus=*|--hostname=*)
+                shift ;;
+            -*) warn "run:忽略不支援的選項:$1"; shift ;;
+            *) break ;;
+        esac
+    done
+    local image="${1:?用法:docker-nosystemd run [docker-run 選項] <image> [cmd [args...]]}"
     shift
-    [[ $# -gt 0 ]] || die "未指定要執行的命令(用法:docker-nosystemd run [--rm] <image> <cmd> [args...])"
+    local -a cmd=()
+    [[ $# -gt 0 ]] && cmd=("$@")
+    if [[ -n "$entrypoint" ]]; then
+        cmd=("$entrypoint" "${cmd[@]}")
+    fi
+    [[ ${#cmd[@]} -gt 0 ]] || die "未指定要執行的命令(用法:docker-nosystemd run [選項] <image> <cmd> [args...])"
     local dockerbin="${DSND_DOCKER_BIN:-docker}"
     local base="${DSND_CHROOT_ROOT:-/var/lib/dsnd-chroot}"
     local cid
@@ -809,18 +862,158 @@ do_scrub_run() {
         rm -rf "$rootfs"
         die "docker export/解出失敗(映像:$image)"
     fi
-    # export 完臨時容器即無用,始終清理;rootfs 由 --rm 決定去留(留著可重跑)
     "$dockerbin" rm "$cid" >/dev/null 2>&1 || true
-    log "以 chroot 執行(rootfs:$rootfs):$*"
-    chroot "$rootfs" "$@"
-    local rc=$?
+    # -v 快照複製(chroot 無法共享掛載:單向副本,容器內修改不回寫)
+    local vol hpath cpath
+    for vol in "${vols[@]}"; do
+        hpath="${vol%%:*}"; cpath="${vol#*:}"
+        if [[ -z "$hpath" || -z "$cpath" || "$cpath" != /* ]]; then
+            warn "忽略無效 -v:$vol(格式 HOST:CONT,CONT 需絕對路徑)"
+            continue
+        fi
+        if [[ -e "$hpath" ]]; then
+            mkdir -p "$rootfs$cpath"
+            cp -a "$hpath"/. "$rootfs$cpath"/ 2>/dev/null || warn "-v 快照複製失敗:$vol"
+            log "-v $vol:已快照複製(單向副本)"
+        else
+            mkdir -p "$hpath" "$rootfs$cpath"
+            log "-v $vol:宿主路徑不存在,已建立空目錄"
+        fi
+    done
+    # -e 環境變量(chroot exec 繼承)
+    local kv
+    for kv in "${envs[@]}"; do
+        export "${kv:?}"
+    done
+    # 容器註冊(-d 持久容器供 ps/stop/rm/logs 管理;前台跑完即清)
+    local crdir=""
+    if [[ $detach -eq 1 ]]; then
+        [[ -z "$name" ]] && name="dsnd-$(date +%s)-$RANDOM"
+        crdir="$base/containers/$name"
+        mkdir -p "$crdir"
+    fi
+    # 命令組裝(-w 以內層 sh -c cd;entrypoint 已併入 cmd)
+    local -a exec_cmd=("${cmd[@]}")
+    if [[ -n "$workdir" ]]; then
+        # shellcheck disable=SC2016  # $0/$@ 需在 rootfs 內的 sh 展開
+        exec_cmd=(/bin/sh -c 'cd "$0" >/dev/null 2>&1 || exit 1; exec "$@"' "$workdir" "${cmd[@]}")
+    fi
+    local rc=0
+    if [[ $detach -eq 1 ]]; then
+        local logfile="${DSND_CHROOT_LOG:-/var/log/dsnd-chroot.log}"
+        nohup chroot "$rootfs" "${exec_cmd[@]}" >> "$logfile" 2>&1 &
+        local bgpid=$!
+        {
+            echo "NAME=$name"
+            echo "IMAGE=$image"
+            echo "PID=$bgpid"
+            echo "CREATED=$(date '+%Y-%m-%d %H:%M:%S')"
+            echo "LOG=$logfile"
+        } > "$crdir/meta.env"
+        if [[ $rm_flag -eq 1 ]]; then
+            warn "--rm 與 -d 併用:rootfs 與容器記錄保留(後台進程退出後不自動清理,請以 rm 子命令清理)"
+        fi
+        log "後台執行:$name(PID $bgpid);日誌:$logfile"
+        return 0
+    fi
+    log "以 chroot 執行(rootfs:$rootfs):${cmd[*]}"
+    chroot "$rootfs" "${exec_cmd[@]}"
+    rc=$?
     if [[ $rm_flag -eq 1 ]]; then
         rm -rf "$rootfs"
         log "--rm 已清理 rootfs"
     else
-        log "rootfs 保留於 $rootfs(重跑同映像可跳過 export;--rm 可自動清理)"
+        log "rootfs 保留於 $rootfs(重跑同映像更快;--rm 可自動清理)"
     fi
     return $rc
+}
+
+# ── chroot 容器管理兼容層(docker ps/stop/rm/logs 對應)──
+# 容器記錄:$DSND_CHROOT_ROOT/containers/<name>/{meta.env,}
+_dsnd_cr_meta() { # <name> — 輸出 meta 檔路徑
+    local base="${DSND_CHROOT_ROOT:-/var/lib/dsnd-chroot}"
+    echo "$base/containers/$1/meta.env"
+}
+
+dsnd_cr_ps() {
+    local base="${DSND_CHROOT_ROOT:-/var/lib/dsnd-chroot}"
+    local d name pid img created status
+    printf '%-24s %-28s %-8s %-10s %s\n' NAME IMAGE PID STATUS CREATED
+    for d in "$base"/containers/*/; do
+        [[ -f "$d/meta.env" ]] || continue
+        name=""; pid=""; img=""; created=""
+        # shellcheck disable=SC1090
+        # shellcheck disable=SC1091  # 動態路徑的 meta 狀態檔
+        . "$d/meta.env" 2>/dev/null || true
+        status="Exited"
+        if [[ -n "${pid:-}" ]] && kill -0 "$pid" 2>/dev/null; then
+            status="Running"
+        fi
+        printf '%-24s %-28s %-8s %-10s %s\n' "${name:-?}" "${img:-?}" "${pid:--}" "$status" "${created:-?}"
+        # 防迭代污染:清掉本輪變量
+        name=""; pid=""; img=""; created=""
+    done
+    return 0
+}
+
+dsnd_cr_stop() { # <name>
+    local meta
+    meta="$(_dsnd_cr_meta "${1:?用法:docker-nosystemd stop <容器名>}")"
+    [[ -f "$meta" ]] || die "找不到容器:$1(以 docker-nosystemd ps 查看)"
+    local pid=""
+    # shellcheck disable=SC1090
+    . "$meta" 2>/dev/null || true
+    pid="${PID:-}"
+    [[ -n "$pid" ]] || die "容器 $1 無 PID 記錄(非 -d 容器?)"
+    if ! kill -0 "$pid" 2>/dev/null; then
+        log "容器 $1 已不在運行(PID $pid)"
+        return 0
+    fi
+    kill "$pid" 2>/dev/null || true
+    local i
+    for i in 1 2 3 4 5 6 7 8 9 10; do
+        kill -0 "$pid" 2>/dev/null || break
+        sleep 0.5
+    done
+    if kill -0 "$pid" 2>/dev/null; then
+        kill -KILL "$pid" 2>/dev/null || true
+    fi
+    log "容器 $1 已停止(PID $pid)"
+    return 0
+}
+
+dsnd_cr_rm() { # <name>
+    local base="${DSND_CHROOT_ROOT:-/var/lib/dsnd-chroot}"
+    local name="${1:?用法:docker-nosystemd rm <容器名>}"
+    local crdir="$base/containers/$name"
+    [[ -f "$crdir/meta.env" ]] || die "找不到容器:$name(以 docker-nosystemd ps 查看)"
+    local pid=""
+    # shellcheck disable=SC1090
+    # shellcheck disable=SC1091  # 動態路徑的 meta 狀態檔
+    . "$crdir/meta.env" 2>/dev/null || true
+    pid="${PID:-}"
+    if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+        kill "$pid" 2>/dev/null || true
+        sleep 1
+        kill -KILL "$pid" 2>/dev/null || true
+    fi
+    rm -rf "$crdir"
+    log "容器 $name 已刪除(rootfs 映像快取不受影響)"
+    return 0
+}
+
+dsnd_cr_logs() { # <name> [lines]
+    local meta
+    meta="$(_dsnd_cr_meta "${1:?用法:docker-nosystemd logs <容器名> [行數]}")"
+    [[ -f "$meta" ]] || die "找不到容器:$1(以 docker-nosystemd ps 查看)"
+    local logfile="" pid=""
+    # shellcheck disable=SC1090
+    . "$meta" 2>/dev/null || true
+    logfile="${LOG:-}"
+    [[ -n "$logfile" && -f "$logfile" ]] || die "容器 $1 無日誌檔($logfile)"
+    local n="${2:-50}"
+    tail -n "$n" -- "$logfile"
+    return 0
 }
 
 # 探測 + 生成 daemon.json + 啟動,失敗自動降級重試
@@ -1065,6 +1258,12 @@ docker-nosystemd — 無 systemd 環境的 Docker 安裝與管理
    run [--rm] <image> <cmd> [args...]
               docker create → export 解出 → chroot 執行(「窮人容器」,需 root;
               適用連 OCI runtime 都被沙箱焊死的環境;無 ns/cgroup/proc 隔離)
+              支援 docker run 選項:-d/-e/--name/-v(快照)/-w/--entrypoint/--rm;
+              -d 容器可由 ps/stop/rm/logs 管理
+   ps         列出 chroot 容器(-d 啟動的)
+   rm <name>  刪除 chroot 容器(自動停止其進程)
+   stop <name> 停止 chroot 容器(無參 = 停 dockerd,原行為)
+   logs <name> [N] 查看 chroot 容器日誌(無參/-f/N = dockerd 日誌,原行為)
    status     查詢運行狀態(運行中返回 0,未運行返回 1)
   logs [N|-f] 查看 dockerd 日誌(默認 50 行,-f 跟隨)
   doctor     環境診斷(不修改任何東西)
@@ -1088,12 +1287,12 @@ EOF
 }
 
 main() {
-    local cmd="${1:-}"
-    if [[ -z "$cmd" ]]; then
+    local _sub="${1:-}"
+    if [[ -z "$_sub" ]]; then
         usage >&2
         return 1
     fi
-    case "$cmd" in
+    case "$_sub" in
         -h | --help | help)
             usage
             return 0
@@ -1117,6 +1316,11 @@ main() {
         stop)
             require_root || return 1
             shift
+            # 帶容器名參數 = 停 chroot 容器;無參(或僅 --quiet)= 停 dockerd
+            if [[ $# -gt 0 && "$1" != --quiet && "$1" != -q ]]; then
+                dsnd_cr_stop "$1"
+                return $?
+            fi
             while [[ $# -gt 0 ]]; do
                 case "$1" in
                     --quiet | -q) export DSND_QUIET=1 ;;
@@ -1138,18 +1342,30 @@ main() {
             shift
             do_scrub_run "$@"
             ;;
+        ps)
+            dsnd_cr_ps
+            ;;
+        rm)
+            shift
+            dsnd_cr_rm "${1:?用法:docker-nosystemd rm <容器名>}"
+            ;;
         status)
             do_status
             ;;
         logs)
             shift
+            # 第一參為 -f 或純數字 = dockerd 日誌(原行為);其他 = chroot 容器日誌
+            if [[ $# -gt 0 && "$1" != -f && "$1" != --follow && ! "$1" =~ ^[0-9]+$ ]]; then
+                dsnd_cr_logs "$1" "${2:-}"
+                return $?
+            fi
             do_logs "$@"
             ;;
         doctor)
             do_doctor
             ;;
         *)
-            warn "未知命令:$cmd(使用 --help 查看用法)"
+            warn "未知命令:$_sub(使用 --help 查看用法)"
             return 1
             ;;
     esac
