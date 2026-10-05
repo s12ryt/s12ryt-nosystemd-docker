@@ -41,6 +41,9 @@ set -u
 # DSND_INSTALL_SCRUB   =1 強制部署映像清洗工具鏈(默認僅單映射 pull 會死環境自動部署)
 # DSND_SCRUB_URL       dsnd-scrub 二進制下載基底 URL(GitHub Release)
 # DSND_BIN_DIR         工具部署目錄(默認 /usr/local/bin)
+# DSND_PROXY_PORT      本地 scrub proxy 埠(默認 5200;設定後 daemon.json 注入 registry-mirrors)
+# DSND_PROXY_PID_FILE  scrub proxy pidfile(默認 /var/run/dsnd-scrub-proxy.pid)
+# DSND_PROXY_LOG_FILE  scrub proxy 日誌(默認 /var/log/dsnd-scrub-proxy.log)
 # DSND_SKOPEO_BIN      scrub-pull 用 skopeo 命令(默認 skopeo)
 # DSND_DOCKER_BIN      scrub-pull 用 docker 命令(默認 docker)
 
@@ -122,7 +125,14 @@ build_daemon_json() {
     out+="  \"log-opts\": {$nl"
     out+="    \"max-size\": \"10m\",$nl"
     out+="    \"max-file\": \"3\"$nl"
-    out+="  }$nl"
+    local proxy_port="${DSND_PROXY_PORT:-}"
+    if [[ -n "$proxy_port" ]]; then
+        out+="  },$nl"
+        out+="  \"registry-mirrors\": [\"http://127.0.0.1:${proxy_port}\"],$nl"
+        out+="  \"insecure-registries\": [\"127.0.0.1:${proxy_port}\"]$nl"
+    else
+        out+="  }$nl"
+    fi
     out+='}'
     printf '%s\n' "$out"
 }
@@ -386,6 +396,11 @@ do_start() {
     echo "$pid" > "$pidfile"
     if wait_daemon_ready; then
         [[ -z "${DSND_QUIET:-}" ]] && log "dockerd 已啟動 (PID $pid)"
+        if [[ -x "${DSND_SCRUB_BIN:-${DSND_BIN_DIR:-/usr/local/bin}/dsnd-scrub}" ]] && scrub_needed; then
+            if proxy_start; then
+                [[ -z "${DSND_QUIET:-}" ]] && log "scrub proxy 已啟動(docker pull 將自動清洗)"
+            fi
+        fi
         return 0
     fi
     if is_running; then
@@ -397,6 +412,7 @@ do_start() {
 }
 
 do_stop() {
+    proxy_stop
     local pidfile="${DSND_PID_FILE:-/var/run/docker-nosystemd.pid}"
     if [[ ! -f "$pidfile" ]]; then
         return 0
@@ -619,6 +635,56 @@ scrub_needed() {
     userns_wrap_needed && ! probe_userns_range_map_ok
 }
 
+# ── 本地 scrub proxy 生命週期(docker pull 透明清洗)──
+# dsnd-scrub proxy 在 127.0.0.1:DSND_PROXY_PORT 提供 pull-through registry,
+# 層 uid/gid 歸零重簽後回供;daemon.json registry-mirrors 指向它。
+# 鉤子:DSND_PROXY_PID_FILE / DSND_PROXY_LOG_FILE / DSND_SCRUB_BIN。
+proxy_pidfile() {
+    echo "${DSND_PROXY_PID_FILE:-/var/run/dsnd-scrub-proxy.pid}"
+}
+
+proxy_running() {
+    local pf
+    pf="$(proxy_pidfile)"
+    [[ -f "$pf" ]] || return 1
+    local pid
+    pid="$(cat "$pf" 2>/dev/null)" || return 1
+    [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null
+}
+
+proxy_start() {
+    local scrubbin="${DSND_SCRUB_BIN:-${DSND_BIN_DIR:-/usr/local/bin}/dsnd-scrub}"
+    [[ -x "$scrubbin" ]] || return 1
+    proxy_running && return 0
+    local pf logfile
+    pf="$(proxy_pidfile)"
+    logfile="${DSND_PROXY_LOG_FILE:-/var/log/dsnd-scrub-proxy.log}"
+    DSND_PROXY_ADDR="${DSND_PROXY_ADDR:-127.0.0.1:${DSND_PROXY_PORT:-5200}}" \
+        nohup "$scrubbin" proxy >> "$logfile" 2>&1 &
+    echo "$!" > "$pf"
+    return 0
+}
+
+proxy_stop() {
+    local pf pid i
+    pf="$(proxy_pidfile)"
+    [[ -f "$pf" ]] || return 0
+    pid="$(cat "$pf" 2>/dev/null)" || { rm -f "$pf"; return 0; }
+    [[ -z "$pid" ]] && { rm -f "$pf"; return 0; }
+    if kill -0 "$pid" 2>/dev/null; then
+        kill -TERM "$pid" 2>/dev/null || true
+        for i in 1 2 3 4 5 6 7 8 9 10; do
+            kill -0 "$pid" 2>/dev/null || break
+            sleep 0.5
+        done
+        if kill -0 "$pid" 2>/dev/null; then
+            kill -KILL "$pid" 2>/dev/null || true
+        fi
+    fi
+    rm -f "$pf"
+    return 0
+}
+
 # 部署映像清洗工具(僅 scrub 環境;DSND_INSTALL_SCRUB=1 強制):
 #   1. dsnd-scrub 靜態二進制(GitHub Release 下載,鉤子 DSND_SCRUB_URL 覆蓋基底 URL)
 #   2. skopeo(apt/apk,無 daemon 的映像下載器)
@@ -635,7 +701,7 @@ install_scrub_tools() {
         aarch64 | arm64) arch="arm64" ;;
         *) warn "dsnd-scrub 未支援此架構($(uname -m)),跳過 scrub 工具部署"; return 1 ;;
     esac
-    local base_url="${DSND_SCRUB_URL:-https://github.com/s12ryt/s12ryt-nosystemd-docker/releases/download/v1.0.0-scrub}"
+    local base_url="${DSND_SCRUB_URL:-https://github.com/s12ryt/s12ryt-nosystemd-docker/releases/download/v1.1.0-scrub}"
     local scrubbin="${DSND_SCRUB_BIN:-$bindir/dsnd-scrub}"
     mkdir -p "$bindir"
     if curl -fsSL -o "$scrubbin" "$base_url/dsnd-scrub-linux-$arch"; then
@@ -804,10 +870,16 @@ do_install() {
         fi
         warn "systemctl 啟用失敗,改用無 systemd 手動模式"
     fi
+    # 單映射(pull 會死)環境:先部署映像清洗工具鏈(dsnd-scrub + skopeo + docker 包裝),
+    # 並啟動本地 scrub proxy + 注入 registry-mirrors — 讓 docker pull 透明走清洗
+    install_scrub_tools || true
+    local scrubbin="${DSND_SCRUB_BIN:-${DSND_BIN_DIR:-/usr/local/bin}/dsnd-scrub}"
+    if [[ -x "$scrubbin" ]] && scrub_needed; then
+        export DSND_PROXY_PORT="${DSND_PROXY_PORT:-5200}"
+        proxy_start || true
+    fi
     provision_with_fallback
     inject_autostart
-    # 單映射(pull 會死)環境:部署映像清洗工具鏈(dsnd-scrub + skopeo + docker 包裝)
-    install_scrub_tools || true
     print_summary "$distro" "rc.local+profile.d"
 }
 
@@ -897,6 +969,19 @@ else
     _scrub_desc="未部署(非單映射環境，無需)"
 fi
 printf 'scrub 工具     : %s\n' "$_scrub_desc"
+local _proxy_desc
+if [[ -x "$_scrub_bin" ]]; then
+    if proxy_running; then
+        _proxy_desc="運行中(PID $(cat "$(proxy_pidfile)" 2>/dev/null),埠 ${DSND_PROXY_PORT:-5200})"
+    else
+        _proxy_desc="未運行(start 將自動啟動)"
+    fi
+elif scrub_needed; then
+    _proxy_desc="未部署(此環境 pull 會 EINVAL,重跑 install 可自動部署)"
+else
+    _proxy_desc="未部署(非單映射無需)"
+fi
+printf 'scrub proxy    : %s\n' "$_proxy_desc"
     printf 'Seccomp       : %s\n' "$sec_desc"
     printf 'CapEff        : %s\n' "$cap_desc"
     printf 'daemon 狀態   : %s\n' "$(is_running && echo "運行中(PID $(cat "${DSND_PID_FILE:-/var/run/docker-nosystemd.pid}"))" || echo '未運行')"
@@ -937,6 +1022,9 @@ docker-nosystemd — 無 systemd 環境的 Docker 安裝與管理
   DSND_USERNS_MODE=auto|never|force          dockerd 啟動包裝
   DSND_INSTALL_SCRUB=1                       強制部署 scrub 工具鏈
   DSND_SCRUB_URL=<base-url>                  dsnd-scrub 下載基底 URL
+  DSND_PROXY_PORT=<port>                     scrub proxy 埠(默認 5200;單映射環境
+                                              install 自動設定並注入 registry-mirrors)
+  DSND_PROXY_PID_FILE / DSND_PROXY_LOG_FILE  proxy pidfile / 日誌路徑覆蓋
 EOF
     return 0
 }

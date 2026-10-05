@@ -351,9 +351,13 @@ func usage() {
 Usage:
   dsnd-scrub file <in.tar> <out.tar>   Scrub an OCI-layout docker archive
                                        (uid/gid -> 0:0, digest chain re-signed)
+  dsnd-scrub proxy                     Run local pull-through registry proxy
+                                       (scrubs layers on the fly; env-tunable)
   dsnd-scrub -h | --help               Show this help
 
-Phase2 (planned): "proxy" — local pull-through registry that scrubs on the fly.
+Proxy env: DSND_PROXY_ADDR (127.0.0.1:5200), DSND_PROXY_UPSTREAM
+(registry-1.docker.io), DSND_PROXY_AUTH (auth.docker.io/token),
+DSND_PROXY_CACHE (/var/cache/dsnd-scrub-proxy).
 `)
 }
 
@@ -376,6 +380,8 @@ func run(args []string) int {
 			return 1
 		}
 		return 0
+	case "proxy":
+		return runProxy()
 	default:
 		fmt.Fprintf(os.Stderr, "error: unknown subcommand %q\n\n", args[0])
 		usage()
