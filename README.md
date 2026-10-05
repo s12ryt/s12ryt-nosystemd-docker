@@ -55,6 +55,7 @@ sudo bash src/docker-nosystemd.sh install
 | `stop` | 停止 dockerd(TERM → 15s → KILL;冪等) | ✅ |
 | `restart` | 重啟 dockerd | ✅ |
 | `scrub-pull <image>` | 下載映像 → 層歸零重簽 → `docker load`(單映射環境的 pull 替代) | ❌ |
+| `run [--rm] <image> <cmd>` | `docker create` → `export` 解出 → `chroot` 執行(「窮人容器」,見 scrub 章節) | ✅ |
 | `status` | 查詢狀態(運行中返回 0,未運行返回 1) | ❌ |
 | `logs [N\|-f]` | 查看 dockerd 日誌(默認 50 行,`-f` 跟隨) | ❌ |
 | `doctor` | 環境診斷(不修改任何東西) | ❌ |
@@ -111,7 +112,7 @@ DSND_USERNS_MODE=auto|never|force          # dockerd 啟動包裝(見下節)
 ## 測試
 
 ```bash
-bash tests/run-tests.sh              # 單元測試(bash mini 框架,204 斷言;單文件逾時自動標記 TIMEOUT)
+bash tests/run-tests.sh              # 單元測試(bash mini 框架,215 斷言;單文件逾時自動標記 TIMEOUT)
 bash tests/run-tests.sh && shellcheck install.sh src/docker-nosystemd.sh
 bash tests/integration/test_install_debian.sh   # 需 root + 無 systemd 的 Debian
 ```
@@ -140,6 +141,18 @@ docker run --rm busybox:latest true   # 驗證
 - 副作用:映像內所有檔案變 `root:root`(一般應用無感;sshd 等權限敏感應用的極少數檔案有影響)
 - **compose 全透明**:本地 proxy 已接入 `registry-mirrors`,`docker compose up` 的內建自動 pull 也走清洗管線(注意 `registry-mirrors` 僅對 docker.io 映像生效;其他 registry 的 pull 由 `/usr/local/bin/docker` 包裝攔截轉發)
 - 支援未壓縮 / gzip 層、多 manifest 遍歷;`doctor` 顯示 scrub 工具與 proxy 運行狀態
+
+### `run` 子命令(chroot 執行,「窮人容器」)
+
+部分沙箱(如 K8s unprivileged pod)連 OCI runtime 都焊死 — cgroup 唯讀、mount syscall 被 seccomp 全擋、userns 映射寫入被拒,`docker run` 在 runc/crun 階段必死。只要 `chroot` 可用(CAP_SYS_CHROOT 是 Docker 默認 caps 之一),`run` 子命令提供最後一級執行:
+
+```bash
+docker-nosystemd run busybox:latest /bin/true     # create → export 解出 → chroot 執行
+docker-nosystemd run --rm busybox:latest sh -c 'echo hi'
+```
+
+- 原理:`docker create` + `docker export` 把映像解出到 `/var/lib/dsnd-chroot/<image>`(可用 `DSND_CHROOT_ROOT` 覆蓋),再 `chroot` 進去執行指定命令;無 `--rm` 時 rootfs 保留(重跑同映像更快)
+- **限制(誠實標註)**:無 namespace / cgroup 隔離、rootfs 內沒有 `/proc` — busybox 工具、腳本、靜態服務可用;讀 `/proc` 的複雜應用(部分 Go/nginx)可能不行
 
 ## 已知限制
 

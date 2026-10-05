@@ -784,6 +784,45 @@ do_scrub_pull() {
     log "完成:$ref 已以清洗後形式載入(屬主全為 root:root)"
 }
 
+# scrub-run:docker create → export 解出 → chroot 執行(「窮人容器」)
+# 適用:沙箱連 OCI runtime rootless 都焊死(cgroup ro + mount seccomp)、
+# 但 chroot 可用的環境(如 K8s unprivileged pod)。無 ns/cgroup 隔離,
+# 無 /proc — busybox/腳本/靜態服務可用;讀 /proc 的複雜應用不行。
+# 鉤子:DSND_DOCKER_BIN / DSND_CHROOT_ROOT(默認 /var/lib/dsnd-chroot)
+do_scrub_run() {
+    local rm_flag=0
+    if [[ "${1:-}" == "--rm" ]]; then rm_flag=1; shift; fi
+    local image="${1:?用法:docker-nosystemd run [--rm] <image> <cmd> [args...]}"
+    shift
+    [[ $# -gt 0 ]] || die "未指定要執行的命令(用法:docker-nosystemd run [--rm] <image> <cmd> [args...])"
+    local dockerbin="${DSND_DOCKER_BIN:-docker}"
+    local base="${DSND_CHROOT_ROOT:-/var/lib/dsnd-chroot}"
+    local cid
+    cid="$("$dockerbin" create "$image" 2>/dev/null)" || die "docker create 失敗(映像存在嗎?$image)"
+    local safe="${image//\//_}"
+    safe="${safe//:/_}"
+    local rootfs="$base/$safe"
+    rm -rf "$rootfs"
+    mkdir -p "$rootfs"
+    if ! "$dockerbin" export "$cid" | tar -x -C "$rootfs"; then
+        "$dockerbin" rm "$cid" >/dev/null 2>&1 || true
+        rm -rf "$rootfs"
+        die "docker export/解出失敗(映像:$image)"
+    fi
+    # export 完臨時容器即無用,始終清理;rootfs 由 --rm 決定去留(留著可重跑)
+    "$dockerbin" rm "$cid" >/dev/null 2>&1 || true
+    log "以 chroot 執行(rootfs:$rootfs):$*"
+    chroot "$rootfs" "$@"
+    local rc=$?
+    if [[ $rm_flag -eq 1 ]]; then
+        rm -rf "$rootfs"
+        log "--rm 已清理 rootfs"
+    else
+        log "rootfs 保留於 $rootfs(重跑同映像可跳過 export;--rm 可自動清理)"
+    fi
+    return $rc
+}
+
 # 探測 + 生成 daemon.json + 啟動,失敗自動降級重試
 provision_with_fallback() {
     local net="${DSND_FORCE_NET_MODE:-}"
@@ -1021,9 +1060,12 @@ docker-nosystemd — 無 systemd 環境的 Docker 安裝與管理
   start      啟動 dockerd,冪等(已運行則跳過)(需 root)
   stop       停止 dockerd,冪等(需 root)
   restart    重啟 dockerd(需 root)
-  scrub-pull <image>[:tag]
-             下載映像 → 層 uid/gid 歸零重簽 → docker load(單映射環境的一鍵拉取)
-  status     查詢運行狀態(運行中返回 0,未運行返回 1)
+   scrub-pull <image>[:tag]
+              下載映像 → 層 uid/gid 歸零重簽 → docker load(單映射環境的一鍵拉取)
+   run [--rm] <image> <cmd> [args...]
+              docker create → export 解出 → chroot 執行(「窮人容器」,需 root;
+              適用連 OCI runtime 都被沙箱焊死的環境;無 ns/cgroup/proc 隔離)
+   status     查詢運行狀態(運行中返回 0,未運行返回 1)
   logs [N|-f] 查看 dockerd 日誌(默認 50 行,-f 跟隨)
   doctor     環境診斷(不修改任何東西)
   help       顯示本說明
@@ -1090,6 +1132,11 @@ main() {
         scrub-pull)
             shift
             do_scrub_pull "$@"
+            ;;
+        run)
+            require_root || return 1
+            shift
+            do_scrub_run "$@"
             ;;
         status)
             do_status
