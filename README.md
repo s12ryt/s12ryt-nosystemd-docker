@@ -88,8 +88,15 @@ DSND_USERNS_MODE=auto|never|force          # dockerd 啟動包裝(見下節)
 - `auto`(默認):直接 `unshare -m` 可行 → 不包裝;被拒但 `unshare -U` 可行 → 自動包裝
 - `never`:禁用;`force`:只要 userns 可行就包裝
 - 探測命令:`unshare -U true && echo 可行`(失敗 = 核心/seccomp 擋了 userns,此模式無法使用)
-- `doctor` 會顯示 `userns 包裝模式` 決策結果
+- `doctor` 會顯示 `userns 包裝模式` / `userns 範圍映射` 決策結果
 - 包裝模式會自動傳 `-G root` 給 dockerd:unix socket 的 group 改為映射內的 gid 0,否則 chown `/var/run/docker.sock` 到默認 `docker` group(映射外 gid)會報 `invalid argument`
+
+### 範圍映射模式(0-65535 恆等映射)
+
+包裝模式啟動時,腳本會進一步探測能否寫入 user namespace 的恆等範圍映射(`uid_map`/`gid_map` 各 `0 0 65536`,需要容器 root 具備 `CAP_SETUID`/`CAP_SETGID`):
+
+- **可用**(範圍映射模式):dockerd 先以 `unshare --user` 掛起,由父進程寫入 0-65535 恆等映射後再 exec — 層內任意 uid/gid 的 `lchown` 均落在映射內,`docker pull` 解壓層可正常註冊(等效 rootless Docker 的 subuid 方案,但無需 `/etc/subuid`)。
+- **不可用**(單映射模式,`unshare -Ur -G root`):映像層註冊的 `unshare` 可放行,但 tar 檔內**映射外** gid 的檔案(如 `/etc/shadow` 的 gid 42)會在 `docker pull` 時報 `failed to Lchown "etc/shadow" ... invalid argument` — 此為核心硬限制,只能由宿主以特權模式運行容器徹底解決。
 
 此模式配搭 `vfs` 存儲 + `bridge=none` 網路(腳本會自動降級)即為無特權容器的完整組合;`docker pull` / `docker run` 行為需實機驗證。
 
@@ -103,7 +110,7 @@ DSND_USERNS_MODE=auto|never|force          # dockerd 啟動包裝(見下節)
 ## 測試
 
 ```bash
-bash tests/run-tests.sh              # 單元測試(bash mini 框架,136 斷言)
+bash tests/run-tests.sh              # 單元測試(bash mini 框架,145 斷言)
 bash tests/run-tests.sh && shellcheck install.sh src/docker-nosystemd.sh
 bash tests/integration/test_install_debian.sh   # 需 root + 無 systemd 的 Debian
 ```

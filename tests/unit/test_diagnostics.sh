@@ -124,6 +124,7 @@ test_doctor_mentions_unshare_seccomp_capeff() {
   printf 'Seccomp:\t2\nCapEff:\t00000000a80425fb\n' > "$T/status-doc"
   DSND_PROC_STATUS="$T/status-doc"
   DSND_PID_FILE="$T/none.pid"
+  probe_userns_range_map_ok() { return 0; }
   local out
   out="$(do_doctor 2>&1)" || true
   assert_contains "doctor 應顯示 unshare 掛載ns 探測" "unshare" "$out"
@@ -131,4 +132,5 @@ test_doctor_mentions_unshare_seccomp_capeff() {
   assert_contains "doctor 應顯示 Seccomp 狀態" "Seccomp" "$out"
   assert_contains "doctor 應顯示 CapEff 內容" "CapEff" "$out"
   assert_contains "doctor 應顯示 userns 包裝模式決策" "userns 包裝模式" "$out"
+  assert_contains "doctor 應顯示 userns 範圍映射探測" "userns 範圍映射" "$out"
 }

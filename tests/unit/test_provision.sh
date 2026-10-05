@@ -22,6 +22,12 @@ _setup_provision_stubs() {
   : > "$T/calls"
   write_daemon_config() { printf '%s\n' "$3" >> "$T/calls"; }
   do_stop() { return 0; }
+  # 統一 stub unshare/userns 探測:避免單元測試觸發真實 unshare --user
+  # (真實 probe 在非 root 環境下有不可控的進程收割競態,曾致 runner 偶發掛起)。
+  # 需要「不可用/可用」場景的測試在調用 provision 前自行覆蓋。
+  probe_unshare_mount_ok() { return 0; }
+  probe_unshare_userns_ok() { return 1; }
+  probe_userns_range_map_ok() { return 1; }
   DSND_CONF_FILE="$T/daemon.json"
   DSND_PID_FILE="$T/dsnd.pid"
   DSND_LOG_FILE="$T/daemon.log"
@@ -160,4 +166,20 @@ test_provision_userns_mode_note() {
   assert_eq "userns 可用時 provision 應成功" "0" "$rc"
   assert_contains "應提示以 user namespace 模式運行" "user namespace" "$out"
   assert_not_contains "不應再出現註冊失敗警告" "register layer" "$out"
+}
+
+# ---------- 任務 8:範圍映射可用時提示範圍模式 ----------
+
+test_provision_userns_range_note() {
+  _setup_provision_stubs
+  DSND_FORCE_NET_MODE="none"
+  DSND_FORCE_STORAGE="vfs"
+  probe_unshare_mount_ok() { return 1; }
+  probe_unshare_userns_ok() { return 0; }
+  probe_userns_range_map_ok() { return 0; }
+  do_start() { return 0; }
+  local rc=0 out
+  out="$(provision_with_fallback 2>&1)" || rc=$?
+  assert_eq "範圍映射可用時 provision 應成功" "0" "$rc"
+  assert_contains "應提示範圍映射模式" "範圍映射" "$out"
 }

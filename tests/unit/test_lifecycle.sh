@@ -165,6 +165,7 @@ EOF
   PATH="$T/bin:$PATH"
   is_running() { return 1; }
   userns_wrap_needed() { return 0; }
+  probe_userns_range_map_ok() { return 1; } # 強制走單映射分支
   wait_daemon_ready() { return 0; }
   rm -f "$DSND_PID_FILE" "$T/unshare1.args"
   DSND_QUIET=1 do_start >/dev/null 2>&1
@@ -196,5 +197,48 @@ test_userns_wrap_needed_matrix() {
   assert_eq "auto:雙拒 → 不包裝(無法包)" "1" "$rc"
   DSND_USERNS_MODE=force userns_wrap_needed; rc=$?
   assert_eq "force:userns 拒 → 不包裝" "1" "$rc"
+  source "$SCRIPT_DIR/src/docker-nosystemd.sh"
+}
+
+# ── 任務 8:userns 範圍映射模式(0-65535 恆等映射,層內 chown 全放行)──
+
+test_probe_userns_range_map_ok() {
+  # unshare 用「函數 override」stub(非獨立腳本進程):子 shell 內同步寫檔,
+  # 避免 probe 的 kill $p 在腳本進程完成寫檔前把它殺掉(競態)
+  rm -f "$T/rangeprobe.args"
+  unshare() { echo "unshare $*" >> "$T/rangeprobe.args"; return 0; }
+  # _write 在 probe 的 kill 之前執行:在此同步等待背景子 shell 完成寫檔,
+  # 消除「kill 殺死子 shell 使 echo 來不及執行」的競態
+  _write_userns_maps() {
+    local _i=0
+    while [[ ! -s "$T/rangeprobe.args" && $_i -lt 50 ]]; do sleep 0.1; _i=$((_i+1)); done
+    return 0
+  }
+  _read_userns_map_ok() { return 0; }
+  probe_userns_range_map_ok; local rc=$?
+  assert_eq "映射寫入+驗證成功應返 0" "0" "$rc"
+  local _i=0
+  while [[ ! -s "$T/rangeprobe.args" && $_i -lt 50 ]]; do sleep 0.1; _i=$((_i+1)); done
+  assert_contains "probe 應以 unshare --user 起 ns" "--user" "$(cat "$T/rangeprobe.args" 2>/dev/null || echo MISSING)"
+  _write_userns_maps() { return 1; }
+  probe_userns_range_map_ok; rc=$?
+  assert_eq "映射寫入失敗應返 1" "1" "$rc"
+  unset -f unshare
+  source "$SCRIPT_DIR/src/docker-nosystemd.sh"
+}
+
+test_do_start_userns_range_mode() {
+  _setup_fake
+  is_running() { return 1; }
+  userns_wrap_needed() { return 0; }
+  probe_userns_range_map_ok() { return 0; }
+  launch_dockerd_userns_range() { echo "launch:$1:$2" >> "$T/rangelaunch.calls"; echo 4242; }
+  wait_daemon_ready() { return 0; }
+  rm -f "$DSND_PID_FILE" "$T/rangelaunch.calls"
+  DSND_QUIET=1 do_start >/dev/null 2>&1
+  assert_eq "範圍映射模式 do_start 應成功" "0" "$?"
+  assert_contains "應以範圍映射 launcher 啟動" "$DSND_DOCKERD_BIN" "$(cat "$T/rangelaunch.calls" 2>/dev/null || echo MISSING)"
+  assert_eq "pidfile 應取 launcher 返回 pid" "4242" "$(cat "$DSND_PID_FILE" 2>/dev/null || echo MISSING)"
+  rm -f "$DSND_PID_FILE"
   source "$SCRIPT_DIR/src/docker-nosystemd.sh"
 }

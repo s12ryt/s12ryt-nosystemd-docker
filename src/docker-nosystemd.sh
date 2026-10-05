@@ -35,6 +35,8 @@ set -u
 # DSND_FORCE_NET_MODE   full|noiptables|none(強制網路模式,跳過探測)
 # DSND_FORCE_STORAGE    overlay2|vfs(強制存儲驅動)
 # DSND_PROC_STATUS      /proc/self/status 替代路徑(測試用)
+# DSND_PROC_BASE        /proc 替代根(測試 userns 映射寫入用)
+# DSND_USERNS_MAP_SIZE  userns 恆等映射寬度(默認 65536)
 # DSND_USERNS_MODE      dockerd 啟動包裝:auto(默認)| never | force(unshare -Ur)
 # DSND_FORCE_INSTALL   =1 強制重裝(即使 dockerd 已存在)
 
@@ -222,6 +224,41 @@ probe_unshare_userns_ok() {
     unshare -U true >/dev/null 2>&1
 }
 
+# 對指定進程寫入 user namespace 恆等範圍映射(uid/gid 0..N-1 → 0..N-1)。
+# 需要先 deny setgroups(gid 映射的前置要求);uid_map/gid_map 寫入失敗返回 1。
+# DSND_PROC_BASE:測試鉤子(/proc 替身);DSND_USERNS_MAP_SIZE:映射寬度(默認 65536)
+_write_userns_maps() { # <pid>
+    local base="${DSND_PROC_BASE:-/proc}"
+    echo deny > "$base/$1/setgroups" 2>/dev/null || true
+    printf '0 0 %s\n' "${DSND_USERNS_MAP_SIZE:-65536}" > "$base/$1/uid_map" 2>/dev/null || return 1
+    printf '0 0 %s\n' "${DSND_USERNS_MAP_SIZE:-65536}" > "$base/$1/gid_map" 2>/dev/null || return 1
+}
+
+# 驗證指定進程的 uid_map 已生效(首行第三欄 = 映射寬度)
+_read_userns_map_ok() { # <pid>
+    local base="${DSND_PROC_BASE:-/proc}"
+    [[ "$(awk 'NR==1{print $3}' "$base/$1/uid_map" 2>/dev/null)" == "${DSND_USERNS_MAP_SIZE:-65536}" ]]
+}
+
+# 範圍映射 user namespace 探測:起一個 unshare --user 的掛起進程,由父進程
+# 寫入恆等映射並驗證。成功 = 容器內 root 具備寫 uid_map/gid_map 的權限
+# (CAP_SETUID/CAP_SETGID 或同 uid),docker pull 解壓層的 lchown(任意 uid/gid)
+# 將全落在映射內 → 不再 EINVAL。失敗返回 1。
+probe_userns_range_map_ok() {
+    command -v unshare >/dev/null 2>&1 || return 1
+    # shellcheck disable=SC2016  # 單引號內 $() 需在子 ns 的 bash 內展開
+    unshare --user bash -c 'while [[ -z "$(cat /proc/self/uid_map)" ]]; do sleep 0.05; done' >/dev/null 2>&1 &
+    local p=$!
+    if _write_userns_maps "$p" && _read_userns_map_ok "$p"; then
+        kill "$p" 2>/dev/null
+        wait "$p" 2>/dev/null || true
+        return 0
+    fi
+    kill "$p" 2>/dev/null
+    wait "$p" 2>/dev/null || true
+    return 1
+}
+
 # 是否需要以 user namespace 包裝模式啟動 dockerd(unshare -Ur)。
 # 原理:unshare(CLONE_NEWNS) 檢查「當前 user namespace 內」的 CAP_SYS_ADMIN;
 # 無特權容器直接調用 EPERM,但若核心允許 unprivileged userns,把 dockerd 包進
@@ -283,6 +320,23 @@ wait_daemon_ready() {
     return 1
 }
 
+# 以範圍映射 user namespace 啟動 dockerd:
+#   unshare --user 起一個 bash 掛起等待 uid_map(此時 ns 內無權限),
+#   父進程寫入 0..65535 恆等映射後,bash exec dockerd → pid 全程不變。
+#   映射後 ns 內 root 對映射內任意 uid/gid 的 chown/lchown 全放行,
+#   docker pull 解壓層不再因映射外 gid(如 /etc/shadow 的 gid 42)EINVAL。
+# 回顯 pid 供呼叫方寫入 pidfile(exec 鏈 pid 不變,kill/收養語義一致)。
+launch_dockerd_userns_range() { # <dockerdbin> <logfile>
+    local dockerdbin="$1" logfile="$2"
+    # shellcheck disable=SC2016  # 單引號內 $()/$@ 需在子 ns 的 bash 內展開
+    nohup unshare --user bash -c 'while [[ -z "$(cat /proc/self/uid_map)" ]]; do sleep 0.05; done; exec "$@"' _ "$dockerdbin" >> "$logfile" 2>&1 &
+    local pid=$!
+    if ! _write_userns_maps "$pid"; then
+        warn "user namespace 範圍映射寫入失敗,dockerd 將在無映射 ns 內啟動(預期失敗)"
+    fi
+    echo "$pid"
+}
+
 do_start() {
     local pidfile="${DSND_PID_FILE:-/var/run/docker-nosystemd.pid}"
     local logfile="${DSND_LOG_FILE:-/var/log/docker-nosystemd.log}"
@@ -311,15 +365,22 @@ do_start() {
         fi
     fi
     rm -f "$pidfile"
+    local pid
     if userns_wrap_needed; then
-        [[ -z "${DSND_QUIET:-}" ]] && log "以 user namespace 包裝模式啟動 dockerd(unshare -Ur -G root):映像層註冊將於 ns 內取得 CAP_SYS_ADMIN"
-        # -G root:socket group 設為 gid 0(userns 映射內);默認 docker group 的 gid
-        # 不在 unshare -Ur 的單一 gid 映射內,chown docker.sock 會 EINVAL
-        nohup unshare -Ur "$dockerdbin" -G root >> "$logfile" 2>&1 &
+        if probe_userns_range_map_ok; then
+            [[ -z "${DSND_QUIET:-}" ]] && log "以 user namespace 範圍映射模式啟動 dockerd(0-65535 恆等映射):層內任意 uid/gid chown 均在映射內"
+            pid="$(launch_dockerd_userns_range "$dockerdbin" "$logfile")"
+        else
+            [[ -z "${DSND_QUIET:-}" ]] && log "以 user namespace 單映射包裝模式啟動 dockerd(unshare -Ur -G root):docker pull 對映射外 gid 檔案仍會 EINVAL"
+            # -G root:socket group 設為 gid 0(userns 映射內);默認 docker group 的 gid
+            # 不在 unshare -Ur 的單一 gid 映射內,chown docker.sock 會 EINVAL
+            nohup unshare -Ur "$dockerdbin" -G root >> "$logfile" 2>&1 &
+            pid=$!
+        fi
     else
         nohup "$dockerdbin" >> "$logfile" 2>&1 &
+        pid=$!
     fi
-    local pid=$!
     echo "$pid" > "$pidfile"
     if wait_daemon_ready; then
         [[ -z "${DSND_QUIET:-}" ]] && log "dockerd 已啟動 (PID $pid)"
@@ -589,7 +650,12 @@ provision_with_fallback() {
             # 無 CAP_SYS_ADMIN 的容器會在 pull/load 時才爆 EPERM,提前點破
             if ! probe_unshare_mount_ok; then
                 if userns_wrap_needed; then
-                    log "dockerd 以 user namespace 包裝模式運行:映像層註冊將於 ns 內取得 CAP_SYS_ADMIN(請實測 docker pull)"
+                    if probe_userns_range_map_ok; then
+                        log "dockerd 以 user namespace 範圍映射模式運行:層內任意 uid/gid chown 均在映射內,docker pull 可正常註冊映像層"
+                    else
+                        log "dockerd 以 user namespace 單映射模式運行:映像層註冊的 unshare 將放行,但 tar 內映射外 gid 檔案(如 /etc/shadow,gid 42)chown 仍會 EINVAL"
+                        warn "docker pull 可能部分失敗(lchown: invalid argument);宿主以特權模式運行容器可徹底解決"
+                    fi
                 else
                     warn "unshare(CLONE_NEWNS)不可用:dockerd 已啟動,但拉取/載入映像會失敗"
                     warn "(failed to register layer: unshare: operation not permitted)。此容器缺少 CAP_SYS_ADMIN,需要宿主以特權模式運行容器才能完整使用 Docker"
@@ -714,6 +780,7 @@ do_doctor() {
     printf 'unshare 掛載ns: %s\n' "$(probe_unshare_mount_ok && echo '是' || echo '否(缺 CAP_SYS_ADMIN:映像層註冊將失敗,需宿主開特權)')"
     printf 'user namespace: %s\n' "$(probe_unshare_userns_ok && echo '是' || echo '否(rootless 模式不可用)')"
     printf 'userns 包裝模式: %s\n' "$(userns_wrap_needed && echo '將啟用(dockerd 包進 unshare -Ur,繞過映像層註冊 EPERM)' || echo '未啟用')"
+printf 'userns 範圍映射: %s\n' "$(probe_userns_range_map_ok && echo '可用(0-65535 恆等映射,層內任意 chown 放行)' || echo '不可用(僅單映射:pull 對映射外 gid 檔案會 EINVAL;常見於剝 CAP_SETUID 的環境)')"
     printf 'Seccomp       : %s\n' "$sec_desc"
     printf 'CapEff        : %s\n' "$cap_desc"
     printf 'daemon 狀態   : %s\n' "$(is_running && echo "運行中(PID $(cat "${DSND_PID_FILE:-/var/run/docker-nosystemd.pid}"))" || echo '未運行')"
