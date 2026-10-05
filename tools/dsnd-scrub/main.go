@@ -331,6 +331,13 @@ func cleanTar(raw []byte) ([]byte, error) {
 		hdr.Gid = 0
 		hdr.Uname = "root"
 		hdr.Gname = "root"
+		// buildkit 產出的映像層常帶 PAX xattr 記錄(SCHILY.xattr.*),
+		// GNU 格式無法編碼(tar writer 報 only PAX supports PAXRecords)。
+		// 映像層語義不需要 xattr/atime/ctime — 丟棄以保持輸出確定性。
+		hdr.PAXRecords = nil
+		hdr.Xattrs = nil
+		hdr.AccessTime = time.Time{}
+		hdr.ChangeTime = time.Time{}
 		hdr.Format = tar.FormatGNU
 		if err := tw.WriteHeader(hdr); err != nil {
 			return nil, fmt.Errorf("tar write header %s: %w", hdr.Name, err)

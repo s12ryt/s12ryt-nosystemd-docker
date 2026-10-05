@@ -445,3 +445,91 @@ func TestScrubFileLegacySkopeoArchive(t *testing.T) {
 		t.Errorf("RepoTags changed: %v", tags)
 	}
 }
+
+func TestScrubFileDropsPAXRecords(t *testing.T) {
+	// buildkit 產出的映像層常帶 PAX xattr 記錄(SCHILY.xattr.*);
+	// cleanTar 重寫為 GNU 格式時若不丟棄這些記錄,tar writer 會報
+	// "only PAX supports PAXRecords"(用戶實測 ghcr.io 映像踩中)。
+	var lb bytes.Buffer
+	lw := tar.NewWriter(&lb)
+	lhdr := &tar.Header{
+		Name: "etc/ssl/certs/988a38cb.0", Mode: 0o644, Size: 4,
+		Format:     tar.FormatPAX,
+		PAXRecords: map[string]string{"SCHILY.xattr.user.foo": "bar"},
+		Uid:        100, Gid: 65534,
+	}
+	if err := lw.WriteHeader(lhdr); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := lw.Write([]byte("cert")); err != nil {
+		t.Fatal(err)
+	}
+	lw.Close()
+	layer := lb.Bytes()
+
+	layHex := sha(layer)
+	cfg := map[string]any{"rootfs": map[string]any{"diff_ids": []string{"sha256:" + layHex}}}
+	cfgRaw, _ := json.Marshal(cfg)
+	cfgHex := sha(cfgRaw)
+	mf := []map[string]any{{
+		"Config":   cfgHex + ".json",
+		"RepoTags": []string{"fixture/app:latest"},
+		"Layers":   []string{layHex + ".tar"},
+	}}
+	mfRaw, _ := json.Marshal(mf)
+
+	var ab bytes.Buffer
+	aw := tar.NewWriter(&ab)
+	mk := func(name string, data []byte) {
+		if err := aw.WriteHeader(&tar.Header{Name: name, Mode: 0o644, Size: int64(len(data)), Format: tar.FormatGNU}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := aw.Write(data); err != nil {
+			t.Fatal(err)
+		}
+	}
+	mk(layHex+".tar", layer)
+	mk(cfgHex+".json", cfgRaw)
+	mk("manifest.json", mfRaw)
+	aw.Close()
+
+	dir := t.TempDir()
+	src := filepath.Join(dir, "in.tar")
+	out := filepath.Join(dir, "out.tar")
+	if err := os.WriteFile(src, ab.Bytes(), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := scrubFile(src, out); err != nil {
+		t.Fatalf("scrubFile should drop PAX records and succeed, got: %v", err)
+	}
+	members, err := readMembers(bytes.NewReader(mustRead(t, out)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var mfOut []map[string]any
+	if err := json.Unmarshal(members["manifest.json"], &mfOut); err != nil {
+		t.Fatal(err)
+	}
+	newLay := mfOut[0]["Layers"].([]any)[0].(string)
+	clean, ok := members[newLay]
+	if !ok {
+		t.Fatalf("cleaned layer %s missing from output", newLay)
+	}
+	tr := tar.NewReader(bytes.NewReader(clean))
+	h, err := tr.Next()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if h.Uid != 0 || h.Gid != 0 {
+		t.Errorf("entry uid/gid should be 0/0, got %d/%d", h.Uid, h.Gid)
+	}
+}
+
+func mustRead(t *testing.T, p string) []byte {
+	t.Helper()
+	b, err := os.ReadFile(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b
+}
