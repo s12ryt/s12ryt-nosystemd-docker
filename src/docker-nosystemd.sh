@@ -35,8 +35,7 @@ set -u
 # DSND_FORCE_NET_MODE   full|noiptables|none(強制網路模式,跳過探測)
 # DSND_FORCE_STORAGE    overlay2|vfs(強制存儲驅動)
 # DSND_PROC_STATUS      /proc/self/status 替代路徑(測試用)
-# DSND_PROC_BASE        /proc 替代根(測試 userns 映射寫入用)
-# DSND_USERNS_MAP_SIZE  userns 恆等映射寬度(默認 65536)
+# DSND_USERNS_MAP_SIZE  userns 恆等映射寬度(默認 65536;映射由子 ns 內寫 /proc/self)
 # DSND_USERNS_MODE      dockerd 啟動包裝:auto(默認)| never | force(unshare -Ur)
 # DSND_FORCE_INSTALL   =1 強制重裝(即使 dockerd 已存在)
 
@@ -225,50 +224,33 @@ probe_unshare_userns_ok() {
 }
 
 # 對指定進程寫入 user namespace 恆等範圍映射(uid/gid 0..N-1 → 0..N-1)。
-# 需要先 deny setgroups(gid 映射的前置要求);uid_map/gid_map 寫入失敗返回 1。
+# 範圍映射 user namespace 探測(內部寫法):由子進程在新 user namespace 內
+# 直接寫 /proc/self/{setgroups,uid_map,gid_map} — 繞過父進程寫 /proc/$pid/*
+# 的 ptrace 權限檢查(無特權容器常剝 CAP_SYS_PTRACE 導致外部寫法 EACCES)。
+# 成功 = 容器內 root 具備寫 uid_map/gid_map 的權限(CAP_SETUID/CAP_SETGID),
+# docker pull 解壓層的 lchown(任意 uid/gid)全落在 0-65535 恆等映射內 → 不再 EINVAL。
 # 失敗時將具體原因記錄到全局變量 _DSND_RANGE_FAIL_REASON 供上游輸出。
-# DSND_PROC_BASE:測試鉤子(/proc 替身);DSND_USERNS_MAP_SIZE:映射寬度(默認 65536)
-# 註:重定向採「2>/dev/null > file」順序 — 先導 stderr 再開檔,open 失敗的
-# shell 錯誤才會被吞掉(「> file 2>/dev/null」順序會洩漏一行 Permission denied)
-_write_userns_maps() { # <pid>
-    local base="${DSND_PROC_BASE:-/proc}"
-    _DSND_RANGE_FAIL_REASON=""
-    echo deny 2>/dev/null > "$base/$1/setgroups" || _DSND_RANGE_FAIL_REASON="setgroups deny 被拒(需 CAP_SETGID)"
-    if ! printf '0 0 %s\n' "${DSND_USERNS_MAP_SIZE:-65536}" 2>/dev/null > "$base/$1/uid_map"; then
-        _DSND_RANGE_FAIL_REASON="uid_map 寫入被拒(需 CAP_SETUID)"
-        return 1
-    fi
-    if ! printf '0 0 %s\n' "${DSND_USERNS_MAP_SIZE:-65536}" 2>/dev/null > "$base/$1/gid_map"; then
-        _DSND_RANGE_FAIL_REASON="${_DSND_RANGE_FAIL_REASON:+${_DSND_RANGE_FAIL_REASON};}gid_map 寫入被拒(需 CAP_SETGID,且需先成功 deny setgroups)"
-        return 1
-    fi
-    return 0
-}
-
-# 驗證指定進程的 uid_map 已生效(首行第三欄 = 映射寬度)
-_read_userns_map_ok() { # <pid>
-    local base="${DSND_PROC_BASE:-/proc}"
-    [[ "$(awk 'NR==1{print $3}' "$base/$1/uid_map" 2>/dev/null)" == "${DSND_USERNS_MAP_SIZE:-65536}" ]]
-}
-
-# 範圍映射 user namespace 探測:起一個 unshare --user 的掛起進程,由父進程
-# 寫入恆等映射並驗證。成功 = 容器內 root 具備寫 uid_map/gid_map 的權限
-# (CAP_SETUID/CAP_SETGID 或同 uid),docker pull 解壓層的 lchown(任意 uid/gid)
-# 將全落在映射內 → 不再 EINVAL。失敗返回 1。
+# DSND_USERNS_MAP_SIZE:映射寬度(默認 65536)
+# 註:內部腳本重定向採「2>/dev/null > file」順序 — 先導 stderr 再開檔,
+# open 失敗的 shell 錯誤才會被吞掉,僅以非零退出碼傳遞失敗原因。
+# 退出碼約定:10 = uid_map 寫入失敗;11 = gid_map 寫入失敗;其他 = ns 建立失敗。
 probe_userns_range_map_ok() {
     command -v unshare >/dev/null 2>&1 || { _DSND_RANGE_FAIL_REASON="unshare 命令不可用"; return 1; }
     _DSND_RANGE_FAIL_REASON=""
-    # shellcheck disable=SC2016  # 單引號內 $() 需在子 ns 的 bash 內展開
-    unshare --user bash -c 'while [[ -z "$(cat /proc/self/uid_map)" ]]; do sleep 0.05; done' >/dev/null 2>&1 &
-    local p=$!
-    if _write_userns_maps "$p" && _read_userns_map_ok "$p"; then
-        kill "$p" 2>/dev/null
-        wait "$p" 2>/dev/null || true
-        return 0
-    fi
-    [[ -z "${_DSND_RANGE_FAIL_REASON:-}" ]] && _DSND_RANGE_FAIL_REASON="uid_map 讀回驗證失敗(映射未生效)"
-    kill "$p" 2>/dev/null
-    wait "$p" 2>/dev/null || true
+    local rc=0
+    # shellcheck disable=SC2016  # $1 需在子 ns 的 bash 內展開
+    unshare --user bash -c '
+        echo deny 2>/dev/null > /proc/self/setgroups || true
+        printf "0 0 %s\n" "$1" 2>/dev/null > /proc/self/uid_map || exit 10
+        printf "0 0 %s\n" "$1" 2>/dev/null > /proc/self/gid_map || exit 11
+        exit 0
+    ' _ "${DSND_USERNS_MAP_SIZE:-65536}" >/dev/null 2>&1 || rc=$?
+    case "$rc" in
+        0) return 0 ;;
+        10) _DSND_RANGE_FAIL_REASON="uid_map 寫入被拒(需 CAP_SETUID)" ;;
+        11) _DSND_RANGE_FAIL_REASON="gid_map 寫入被拒(需 CAP_SETGID,且需先成功 deny setgroups)" ;;
+        *) _DSND_RANGE_FAIL_REASON="user namespace 建立失敗(rc=$rc)" ;;
+    esac
     return 1
 }
 
@@ -333,21 +315,23 @@ wait_daemon_ready() {
     return 1
 }
 
-# 以範圍映射 user namespace 啟動 dockerd:
-#   unshare --user 起一個 bash 掛起等待 uid_map(此時 ns 內無權限),
-#   父進程寫入 0..65535 恆等映射後,bash exec dockerd → pid 全程不變。
-#   映射後 ns 內 root 對映射內任意 uid/gid 的 chown/lchown 全放行,
-#   docker pull 解壓層不再因映射外 gid(如 /etc/shadow 的 gid 42)EINVAL。
+# 以範圍映射 user namespace 啟動 dockerd(內部寫法):
+#   unshare --user 起的 bash 在新 ns 內直接寫 /proc/self/{setgroups,uid_map,gid_map}
+#   (0..65535 恆等映射),成功後 exec dockerd → pid 全程不變。
+#   內部寫 /proc/self 繞過父進程寫 /proc/$pid 的 ptrace 權限檢查
+#   (無特權容器常剝 CAP_SYS_PTRACE);映射後 ns 內 root 對映射內任意
+#   uid/gid 的 chown/lchown 全放行,docker pull 解壓層不再 EINVAL
+#   (如 /home 的 nobody:nogroup 65534、/etc/shadow 的 gid 42)。
 # 回顯 pid 供呼叫方寫入 pidfile(exec 鏈 pid 不變,kill/收養語義一致)。
 launch_dockerd_userns_range() { # <dockerdbin> <logfile>
     local dockerdbin="$1" logfile="$2"
-    # shellcheck disable=SC2016  # 單引號內 $()/$@ 需在子 ns 的 bash 內展開
-    nohup unshare --user bash -c 'while [[ -z "$(cat /proc/self/uid_map)" ]]; do sleep 0.05; done; exec "$@"' _ "$dockerdbin" >> "$logfile" 2>&1 &
-    local pid=$!
-    if ! _write_userns_maps "$pid"; then
-        warn "user namespace 範圍映射寫入失敗,dockerd 將在無映射 ns 內啟動(預期失敗)"
-    fi
-    echo "$pid"
+    # shellcheck disable=SC2016  # $1/$@ 需在子 ns 的 bash 內展開
+    nohup unshare --user bash -c '
+        echo deny 2>/dev/null > /proc/self/setgroups || true
+        printf "0 0 %s\n" "$1" 2>/dev/null > /proc/self/uid_map || { echo "[dsnd] uid_map 寫入失敗,即將退出" >&2; exit 90; }
+        printf "0 0 %s\n" "$1" 2>/dev/null > /proc/self/gid_map || { echo "[dsnd] gid_map 寫入失敗,即將退出" >&2; exit 91; }
+        exec "$@"' _ "${DSND_USERNS_MAP_SIZE:-65536}" "$dockerdbin" >> "$logfile" 2>&1 &
+    echo "$!"
 }
 
 do_start() {

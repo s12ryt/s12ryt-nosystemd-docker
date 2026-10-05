@@ -203,27 +203,32 @@ test_userns_wrap_needed_matrix() {
 # ── 任務 8:userns 範圍映射模式(0-65535 恆等映射,層內 chown 全放行)──
 
 test_probe_userns_range_map_ok() {
-  # unshare 用「函數 override」stub(非獨立腳本進程):子 shell 內同步寫檔,
-  # 避免 probe 的 kill $p 在腳本進程完成寫檔前把它殺掉(競態)
+  # 內部寫法:unshare --user bash -c 一條命令完成(無後台進程/無 kill 競態);
+  # 子 ns 內自行寫 /proc/self/{setgroups,uid_map,gid_map},繞過父進程寫
+  # /proc/$p/* 的 ptrace 檢查(無特權容器常見 EACCES 點)。
+  # 子 ns 返回碼分級:10=uid_map 寫入敗,11=gid_map 寫入敗,其他=ns 建立敗
+  local rc=0
   rm -f "$T/rangeprobe.args"
-  unshare() { echo "unshare $*" >> "$T/rangeprobe.args"; return 0; }
-  # _write 在 probe 的 kill 之前執行:在此同步等待背景子 shell 完成寫檔,
-  # 消除「kill 殺死子 shell 使 echo 來不及執行」的競態
-  _write_userns_maps() {
-    local _i=0
-    while [[ ! -s "$T/rangeprobe.args" && $_i -lt 50 ]]; do sleep 0.1; _i=$((_i+1)); done
-    return 0
-  }
-  _read_userns_map_ok() { return 0; }
-  probe_userns_range_map_ok; local rc=$?
-  assert_eq "映射寫入+驗證成功應返 0" "0" "$rc"
-  local _i=0
-  while [[ ! -s "$T/rangeprobe.args" && $_i -lt 50 ]]; do sleep 0.1; _i=$((_i+1)); done
-  assert_contains "probe 應以 unshare --user 起 ns" "--user" "$(cat "$T/rangeprobe.args" 2>/dev/null || echo MISSING)"
-  _write_userns_maps() { return 1; }
+  unshare() { echo "unshare $*" >> "$T/rangeprobe.args"; return "${_STUB_RC:-0}"; }
+  _STUB_RC=0
   probe_userns_range_map_ok; rc=$?
-  assert_eq "映射寫入失敗應返 1" "1" "$rc"
+  assert_eq "範圍映射探測成功應返 0" "0" "$rc"
+  assert_contains "應以 unshare --user 起 ns" "--user" "$(cat "$T/rangeprobe.args" 2>/dev/null || echo MISSING)"
+  assert_contains "應傳入映射寬度 65536" "65536" "$(cat "$T/rangeprobe.args" 2>/dev/null || echo MISSING)"
+  _STUB_RC=10
+  probe_userns_range_map_ok; rc=$?
+  assert_eq "uid_map 寫入失敗應返 1" "1" "$rc"
+  assert_contains "應記錄 uid_map 失敗原因" "uid_map" "${_DSND_RANGE_FAIL_REASON:-}"
+  _STUB_RC=11
+  probe_userns_range_map_ok; rc=$?
+  assert_eq "gid_map 寫入失敗應返 1" "1" "$rc"
+  assert_contains "應記錄 gid_map 失敗原因" "gid_map" "${_DSND_RANGE_FAIL_REASON:-}"
+  _STUB_RC=99
+  probe_userns_range_map_ok; rc=$?
+  assert_eq "ns 建立失敗等其他碼應返 1" "1" "$rc"
+  assert_contains "其他失敗也應帶原因" "失敗" "${_DSND_RANGE_FAIL_REASON:-EMPTY}"
   unset -f unshare
+  unset _STUB_RC
   source "$SCRIPT_DIR/src/docker-nosystemd.sh"
 }
 
@@ -243,33 +248,35 @@ test_do_start_userns_range_mode() {
   source "$SCRIPT_DIR/src/docker-nosystemd.sh"
 }
 
-test_write_userns_maps_records_reason() {
-  local T; T="$(t_tmpdir)"
-  local rc=0
-  # 場景1:目錄不存在 → uid_map 寫入失敗,應記錄原因
-  DSND_PROC_BASE="$T/nonexistent"
-  rc=0
-  _write_userns_maps 999 || rc=$?
-  assert_eq "uid_map 寫入失敗應返回 1" "1" "$rc"
-  assert_contains "應記錄 uid_map 失敗原因" "uid_map" "${_DSND_RANGE_FAIL_REASON:-}"
-  # 場景2:uid_map 可寫、setgroups/gid_map 為目錄(寫入必敗)→ gid_map 失敗(帶 setgroups 連帶)
-  mkdir -p "$T/proc2/123"
-  : > "$T/proc2/123/uid_map"
-  mkdir "$T/proc2/123/setgroups" "$T/proc2/123/gid_map"
-  DSND_PROC_BASE="$T/proc2"
-  rc=0
-  _write_userns_maps 123 || rc=$?
-  assert_eq "gid_map 寫入失敗應返回 1" "1" "$rc"
-  assert_contains "應記錄 gid_map 失敗原因" "gid_map" "${_DSND_RANGE_FAIL_REASON:-}"
-  assert_contains "應連帶記錄 setgroups 失敗" "setgroups" "${_DSND_RANGE_FAIL_REASON:-}"
-  # 場景3:全部可寫 → 成功且原因清空
-  rmdir "$T/proc2/123/setgroups" "$T/proc2/123/gid_map"
-  : > "$T/proc2/123/setgroups"
-  : > "$T/proc2/123/gid_map"
-  rc=0
-  _write_userns_maps 123 || rc=$?
-  assert_eq "全部寫入成功應返回 0" "0" "$rc"
-  assert_eq "成功後原因應清空" "" "${_DSND_RANGE_FAIL_REASON:-}"
-  DSND_PROC_BASE=""
+test_launch_userns_range_internal_writes() {
+  # launcher 應以內部寫法啟動:unshare --user bash -c '子 ns 內自行寫映射後 exec dockerd'
+  # (繞過父進程寫 /proc/$p/* 的 ptrace 檢查 — 無特權容器的外部寫法 EACCES 點)
+  _setup_fake
+  mkdir -p "$T/bin"
+  cat > "$T/bin/unshare" <<EOF
+#!/usr/bin/env bash
+echo "unshare \$*" >> "$T/launch1.args"
+exit 0
+EOF
+  chmod +x "$T/bin/unshare"
+  local saved_path="$PATH"
+  PATH="$T/bin:$PATH"
+  rm -f "$T/launch1.args" "$DSND_LOG_FILE"
+  local pid
+  pid="$(launch_dockerd_userns_range "$DSND_DOCKERD_BIN" "$DSND_LOG_FILE")"
+  if [[ -n "$pid" ]]; then
+    _t_assert; _t_pass
+  else
+    _t_fail "launcher 應回顯背景 pid"
+  fi
+  local _i=0
+  while [[ ! -s "$T/launch1.args" && $_i -lt 50 ]]; do sleep 0.1; _i=$((_i + 1)); done
+  local args
+  args="$(cat "$T/launch1.args" 2>/dev/null || echo MISSING)"
+  assert_contains "launcher 應以 unshare --user 起 ns" "--user" "$args"
+  assert_contains "內部寫法應以 bash -c 執行映射腳本" "bash -c" "$args"
+  assert_contains "應傳入 dockerdbin 供 exec" "$DSND_DOCKERD_BIN" "$args"
+  assert_contains "應傳入映射寬度 65536" "65536" "$args"
+  PATH="$saved_path"
   source "$SCRIPT_DIR/src/docker-nosystemd.sh"
 }

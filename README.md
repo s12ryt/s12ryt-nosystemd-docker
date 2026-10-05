@@ -95,8 +95,8 @@ DSND_USERNS_MODE=auto|never|force          # dockerd 啟動包裝(見下節)
 
 包裝模式啟動時,腳本會進一步探測能否寫入 user namespace 的恆等範圍映射(`uid_map`/`gid_map` 各 `0 0 65536`,需要容器 root 具備 `CAP_SETUID`/`CAP_SETGID`):
 
-- **可用**(範圍映射模式):dockerd 先以 `unshare --user` 掛起,由父進程寫入 0-65535 恆等映射後再 exec — 層內任意 uid/gid 的 `lchown` 均落在映射內,`docker pull` 解壓層可正常註冊(等效 rootless Docker 的 subuid 方案,但無需 `/etc/subuid`)。
-- **不可用**(單映射模式,`unshare -Ur -G root`):映像層註冊的 `unshare` 可放行,但 tar 檔內**映射外** gid 的檔案(如 `/etc/shadow` 的 gid 42)會在 `docker pull` 時報 `failed to Lchown "etc/shadow" ... invalid argument` — 此為核心硬限制,只能由宿主以特權模式運行容器徹底解決。
+- **可用**(範圍映射模式):dockerd 由 `unshare --user` 起的 bash 在**新 ns 內部**直接寫 `/proc/self/{setgroups,uid_map,gid_map}` 完成 0-65535 恆等映射後再 exec — 內部寫法繞過父進程寫 `/proc/$pid/*` 的 ptrace 權限檢查(無特權容器常剝 `CAP_SYS_PTRACE`,外部寫法會 `Permission denied`);層內任意 uid/gid 的 `lchown` 均落在映射內,`docker pull` 解壓層可正常註冊(等效 rootless Docker 的 subuid 方案,但無需 `/etc/subuid`)。
+- **不可用**(單映射模式,`unshare -Ur -G root`):映像層註冊的 `unshare` 可放行,但 tar 檔內**映射外** uid/gid 的檔案(如 `/home` 的 nobody:nogroup 65534、`/etc/shadow` 的 gid 42)會在 `docker pull` 時報 `failed to Lchown ... invalid argument` — 此為核心硬限制,只能由宿主以特權模式運行容器徹底解決。`doctor` 與安裝輸出會附具體失敗原因(如 `uid_map 寫入被拒(需 CAP_SETUID)`)。
 
 此模式配搭 `vfs` 存儲 + `bridge=none` 網路(腳本會自動降級)即為無特權容器的完整組合;`docker pull` / `docker run` 行為需實機驗證。
 
@@ -110,7 +110,7 @@ DSND_USERNS_MODE=auto|never|force          # dockerd 啟動包裝(見下節)
 ## 測試
 
 ```bash
-bash tests/run-tests.sh              # 單元測試(bash mini 框架,155 斷言;單文件逾時自動標記 TIMEOUT)
+bash tests/run-tests.sh              # 單元測試(bash mini 框架,159 斷言;單文件逾時自動標記 TIMEOUT)
 bash tests/run-tests.sh && shellcheck install.sh src/docker-nosystemd.sh
 bash tests/integration/test_install_debian.sh   # 需 root + 無 systemd 的 Debian
 ```
