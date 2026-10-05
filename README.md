@@ -54,6 +54,7 @@ sudo bash src/docker-nosystemd.sh install
 | `start` | 啟動 dockerd(冪等;自動收養已運行的 dockerd) | ✅ |
 | `stop` | 停止 dockerd(TERM → 15s → KILL;冪等) | ✅ |
 | `restart` | 重啟 dockerd | ✅ |
+| `scrub-pull <image>` | 下載映像 → 層歸零重簽 → `docker load`(單映射環境的 pull 替代) | ❌ |
 | `status` | 查詢狀態(運行中返回 0,未運行返回 1) | ❌ |
 | `logs [N\|-f]` | 查看 dockerd 日誌(默認 50 行,`-f` 跟隨) | ❌ |
 | `doctor` | 環境診斷(不修改任何東西) | ❌ |
@@ -110,7 +111,7 @@ DSND_USERNS_MODE=auto|never|force          # dockerd 啟動包裝(見下節)
 ## 測試
 
 ```bash
-bash tests/run-tests.sh              # 單元測試(bash mini 框架,170 斷言;單文件逾時自動標記 TIMEOUT)
+bash tests/run-tests.sh              # 單元測試(bash mini 框架,186 斷言;單文件逾時自動標記 TIMEOUT)
 bash tests/run-tests.sh && shellcheck install.sh src/docker-nosystemd.sh
 bash tests/integration/test_install_debian.sh   # 需 root + 無 systemd 的 Debian
 ```
@@ -118,21 +119,26 @@ bash tests/integration/test_install_debian.sh   # 需 root + 無 systemd 的 Deb
 - 單元測試覆蓋:發行版 / init 偵測、`daemon.json` 降級矩陣、自啟注入冪等、pidfile 生命週期、CLI 行為、一鍵安裝入口。
 - 整合測試已於 WSL Debian 13(關閉 systemd)實機驗證:官方源安裝 docker-ce + Compose v2 → 啟動 → `docker run --rm busybox true` smoke 通過;從零純淨安裝(移除既有 engine)同樣通過。
 
-## 映像清洗工具(scrub-pull)
+## 映像清洗工具(scrub,已整合進一鍵安裝)
 
-當環境連 user namespace 範圍映射都被沙箱攔截(如 gVisor 類平台,`doctor` 顯示 `uid_map 寫入被拒` 且 caps 齊全),`docker pull` 解壓層的 `Lchown` 無法放行 — 此時可改走**補丁映像而非補丁 docker** 的等效路線:
+當環境連 user namespace 範圍映射都被沙箱攔截(如 gVisor 類平台,`doctor` 顯示 `uid_map 寫入被拒` 且 caps 齊全),`docker pull` 解壓層的 `Lchown` 無法放行 — 此時改走**補丁映像而非補丁 docker** 的等效路線。**`install` 偵測到此環境(單映射模式)會自動部署整套工具**(也可 `DSND_INSTALL_SCRUB=1` 強制):
+
+- `/usr/local/bin/dsnd-scrub` — Go 靜態二進制([Release 資產](https://github.com/s12ryt/s12ryt-nosystemd-docker/releases/tag/v1.0.0-scrub),無需 python)
+- `skopeo` — 無 daemon 的映像下載器(apt/apk 自動裝)
+- `/usr/local/bin/docker` 包裝 — **`docker pull busybox` 自動轉發 scrub 流程**,其餘命令原樣透傳(絕對路徑 `/usr/bin/docker` 可繞過)
 
 ```bash
-sudo apt-get install -y skopeo          # 無 daemon 的映像下載器
-bash tools/scrub-pull.sh busybox:latest # skopeo 拉取 → 清洗 → docker load 一條龍
-docker run --rm busybox:latest true     # 驗證
+docker pull busybox:latest            # 自動轉發:下載 → 清洗 → load
+# 等效手動:docker-nosystemd scrub-pull busybox:latest
+docker run --rm busybox:latest true   # 驗證
 ```
 
-原理:`skopeo copy` 以 docker-archive 形式下載映像(不解壓層,繞開死點)→ `tools/docker-scrub.py`(python3,無第三方依賴)把每層 tar 內所有檔案的 uid/gid 歸零為 `0:0`,並級聯重算層 digest → config `diff_ids` → manifest → index → legacy `manifest.json`(docker load 必需)→ `docker load` 匯入。單映射模式(`unshare -Ur`)的 dockerd 對 `Lchown(x, 0, 0)` 全放行 — 死點反轉。
+原理:`skopeo copy` 以 docker-archive 形式下載映像(不解壓層,繞開死點)→ `dsnd-scrub` 把每層 tar 內所有檔案的 uid/gid 歸零為 `0:0`,並級聯重算層 digest → config `diff_ids` → manifest → index → legacy `manifest.json` → `docker load` 匯入。單映射模式(`unshare -Ur`)的 dockerd 對 `Lchown(x, 0, 0)` 全放行 — 死點反轉。
 
-- 已於 WSL 實測:busybox 清洗後 `docker load` 成功、`docker run` 通過
+- 已於 WSL 實測:busybox 清洗後 `docker load` 成功、`docker run` 通過(Go 二進制與 python 版行為等價)
 - 副作用:映像內所有檔案變 `root:root`(一般應用無感;sshd 等權限敏感應用的極少數檔案有影響)
-- 支援未壓縴/ gzip 層、多 manifest 遍歷;docker-archive 產出(gzip 層)請以實際映像驗證
+- **限制**:`docker compose up` 內建的自動 pull 走 daemon API 不經包裝 — compose 場景請先 `docker pull` 各映像再 `up`;`docker compose pull` 同樣被包裝攔截轉發
+- 支援未壓縮 / gzip 層、多 manifest 遍歷;`doctor` 顯示 scrub 工具部署狀態
 
 ## 已知限制
 

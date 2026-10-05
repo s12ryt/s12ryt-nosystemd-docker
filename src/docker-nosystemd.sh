@@ -38,6 +38,11 @@ set -u
 # DSND_USERNS_MAP_SIZE  userns 恆等映射寬度(默認 65536;映射由子 ns 內寫 /proc/self)
 # DSND_USERNS_MODE      dockerd 啟動包裝:auto(默認)| never | force(unshare -Ur)
 # DSND_FORCE_INSTALL   =1 強制重裝(即使 dockerd 已存在)
+# DSND_INSTALL_SCRUB   =1 強制部署映像清洗工具鏈(默認僅單映射 pull 會死環境自動部署)
+# DSND_SCRUB_URL       dsnd-scrub 二進制下載基底 URL(GitHub Release)
+# DSND_BIN_DIR         工具部署目錄(默認 /usr/local/bin)
+# DSND_SKOPEO_BIN      scrub-pull 用 skopeo 命令(默認 skopeo)
+# DSND_DOCKER_BIN      scrub-pull 用 docker 命令(默認 docker)
 
 AUTOSTART_BEGIN="# BEGIN docker-nosystemd autostart"
 AUTOSTART_END="# END docker-nosystemd autostart"
@@ -608,6 +613,95 @@ install_self() {
     chmod +x "$target"
 }
 
+# 是否為「docker pull 會死」的環境:dockerd 需要 userns 包裝(缺 CAP_SYS_ADMIN)
+# 且範圍映射不可用(層內映射外 uid/gid 會 Lchown EINVAL)— 此時 scrub 流程是唯一解。
+scrub_needed() {
+    userns_wrap_needed && ! probe_userns_range_map_ok
+}
+
+# 部署映像清洗工具(僅 scrub 環境;DSND_INSTALL_SCRUB=1 強制):
+#   1. dsnd-scrub 靜態二進制(GitHub Release 下載,鉤子 DSND_SCRUB_URL 覆蓋基底 URL)
+#   2. skopeo(apt/apk,無 daemon 的映像下載器)
+#   3. /usr/local/bin/docker 包裝:攔 `docker pull REF` 轉發 scrub-pull,其餘原樣透傳
+# 任何一步失敗僅 warn 不 die(scrub 是增益功能)。
+install_scrub_tools() {
+    if [[ "${DSND_INSTALL_SCRUB:-0}" != "1" ]] && ! scrub_needed; then
+        return 0
+    fi
+    local bindir="${DSND_BIN_DIR:-/usr/local/bin}"
+    local arch
+    case "$(uname -m)" in
+        x86_64) arch="amd64" ;;
+        aarch64 | arm64) arch="arm64" ;;
+        *) warn "dsnd-scrub 未支援此架構($(uname -m)),跳過 scrub 工具部署"; return 1 ;;
+    esac
+    local base_url="${DSND_SCRUB_URL:-https://github.com/s12ryt/s12ryt-nosystemd-docker/releases/download/v1.0.0-scrub}"
+    local scrubbin="${DSND_SCRUB_BIN:-$bindir/dsnd-scrub}"
+    mkdir -p "$bindir"
+    if curl -fsSL -o "$scrubbin" "$base_url/dsnd-scrub-linux-$arch"; then
+        chmod +x "$scrubbin"
+        log "dsnd-scrub 二進制已部署:$scrubbin"
+    else
+        rm -f "$scrubbin"
+        warn "dsnd-scrub 下載失敗($base_url/dsnd-scrub-linux-$arch);可用 DSND_SCRUB_URL 覆蓋或手動部署"
+        return 1
+    fi
+    if ! command -v "${DSND_SKOPEO_BIN:-skopeo}" >/dev/null 2>&1; then
+        log "安裝 skopeo(無 daemon 映像下載器)…"
+        if command -v apt-get >/dev/null 2>&1; then
+            apt-get update -qq >/dev/null 2>&1 || true
+            apt-get install -y -qq skopeo >/dev/null 2>&1 || warn "skopeo 安裝失敗(apt);scrub-pull 將不可用"
+        elif command -v apk >/dev/null 2>&1; then
+            apk add --quiet skopeo >/dev/null 2>&1 || warn "skopeo 安裝失敗(apk);scrub-pull 將不可用"
+        else
+            warn "找不到套件管理器安裝 skopeo;scrub-pull 將不可用"
+        fi
+    fi
+    # docker 包裝:僅攔 pull;本腳本內部以絕對路徑 /usr/bin/docker 呼叫避免遞迴
+    cat > "$bindir/docker" <<'WRAPPER'
+#!/bin/sh
+# BEGIN docker-nosystemd pull interceptor
+# 攔 `docker pull REF` 轉發映像清洗流程(單映射環境 Lchown EINVAL 的唯一解);
+# 其餘命令原樣透傳真實 docker CLI。
+REAL=/usr/bin/docker
+DSND=/usr/local/bin/docker-nosystemd
+SCRUB=/usr/local/bin/dsnd-scrub
+if [ "$1" = "pull" ] && [ -n "$2" ] && [ -z "$3" ] \
+    && [ -x "$SCRUB" ] && command -v skopeo >/dev/null 2>&1 \
+    && [ -x "$DSND" ]; then
+    exec "$DSND" scrub-pull "$2"
+fi
+exec "$REAL" "$@"
+# END docker-nosystemd pull interceptor
+WRAPPER
+    chmod +x "$bindir/docker"
+    log "docker 包裝已部署:$bindir/docker(docker pull 自動轉發 scrub 流程)"
+    log "注意:docker compose 內建的自動 pull 不經包裝;compose 環境請先 docker pull 各映像再 up"
+}
+
+# scrub-pull:skopeo 下載(不解壓)→ dsnd-scrub 歸零重簽 → docker load
+# 鉤子:DSND_SKOPEO_BIN / DSND_SCRUB_BIN / DSND_DOCKER_BIN(默認 docker)
+do_scrub_pull() {
+    local ref="${1:?用法:docker-nosystemd scrub-pull <image>[:tag]}"
+    local scrubbin="${DSND_SCRUB_BIN:-/usr/local/bin/dsnd-scrub}"
+    local skopeobin="${DSND_SKOPEO_BIN:-skopeo}"
+    local dockerbin="${DSND_DOCKER_BIN:-docker}"
+    [[ -x "$scrubbin" ]] || die "dsnd-scrub 不存在($scrubbin);請重新執行 install 或手動部署"
+    command -v "$skopeobin" >/dev/null 2>&1 || die "skopeo 不可用;請安裝(apt-get install -y skopeo)"
+    local tmp_raw tmp_clean
+    tmp_raw="$(mktemp "${TMPDIR:-/tmp}/dsnd-pull-raw.XXXXXX.tar")"
+    tmp_clean="$(mktemp "${TMPDIR:-/tmp}/dsnd-pull-clean.XXXXXX.tar")"
+    # shellcheck disable=SC2064 # trap 展開此刻的變量
+    trap "rm -f '$tmp_raw' '$tmp_clean'" RETURN
+    log "下載映像(不經 dockerd):$ref"
+    "$skopeobin" copy "docker://$ref" "docker-archive:$tmp_raw" || die "skopeo 下載失敗:$ref"
+    log "清洗層 uid/gid → 0:0 並重簽 digest 鏈…"
+    "$scrubbin" file "$tmp_raw" "$tmp_clean" || die "dsnd-scrub 清洗失敗"
+    log "匯入本機 dockerd…"
+    "$dockerbin" load -i "$tmp_clean" || die "docker load 失敗(映像:$ref)"
+    log "完成:$ref 已以清洗後形式載入(屬主全為 root:root)"
+}
+
 # 探測 + 生成 daemon.json + 啟動,失敗自動降級重試
 provision_with_fallback() {
     local net="${DSND_FORCE_NET_MODE:-}"
@@ -712,6 +806,8 @@ do_install() {
     fi
     provision_with_fallback
     inject_autostart
+    # 單映射(pull 會死)環境:部署映像清洗工具鏈(dsnd-scrub + skopeo + docker 包裝)
+    install_scrub_tools || true
     print_summary "$distro" "rc.local+profile.d"
 }
 
@@ -784,6 +880,23 @@ if [[ "$_range_ok" == 1 ]]; then
 else
     printf 'userns 範圍映射: 不可用(%s;pull 對映射外 gid 檔案會 EINVAL)\n' "${_DSND_RANGE_FAIL_REASON:-原因未知}"
 fi
+local _scrub_bin="${DSND_SCRUB_BIN:-${DSND_BIN_DIR:-/usr/local/bin}/dsnd-scrub}"
+local _scrub_desc
+if [[ -x "$_scrub_bin" ]]; then
+    _scrub_desc="已部署($_scrub_bin"
+    if command -v "${DSND_SKOPEO_BIN:-skopeo}" >/dev/null 2>&1; then
+        _scrub_desc+=" + skopeo"
+    else
+        _scrub_desc+="，但 skopeo 缺失"
+    fi
+    [[ -x "${DSND_BIN_DIR:-/usr/local/bin}/docker" ]] && _scrub_desc+="；docker pull 已自動轉發"
+    _scrub_desc+=")"
+elif scrub_needed; then
+    _scrub_desc="未部署(此環境 docker pull 會 Lchown EINVAL；重新執行 install 可自動部署)"
+else
+    _scrub_desc="未部署(非單映射環境，無需)"
+fi
+printf 'scrub 工具     : %s\n' "$_scrub_desc"
     printf 'Seccomp       : %s\n' "$sec_desc"
     printf 'CapEff        : %s\n' "$cap_desc"
     printf 'daemon 狀態   : %s\n' "$(is_running && echo "運行中(PID $(cat "${DSND_PID_FILE:-/var/run/docker-nosystemd.pid}"))" || echo '未運行')"
@@ -803,9 +916,12 @@ docker-nosystemd — 無 systemd 環境的 Docker 安裝與管理
 
 命令:
   install    安裝 Docker Engine + Compose v2,生成 daemon.json 並啟動(需 root)
+             單映射(pull 會 EINVAL)環境自動部署 dsnd-scrub + skopeo + docker 包裝
   start      啟動 dockerd,冪等(已運行則跳過)(需 root)
   stop       停止 dockerd,冪等(需 root)
   restart    重啟 dockerd(需 root)
+  scrub-pull <image>[:tag]
+             下載映像 → 層 uid/gid 歸零重簽 → docker load(單映射環境的一鍵拉取)
   status     查詢運行狀態(運行中返回 0,未運行返回 1)
   logs [N|-f] 查看 dockerd 日誌(默認 50 行,-f 跟隨)
   doctor     環境診斷(不修改任何東西)
@@ -818,6 +934,9 @@ docker-nosystemd — 無 systemd 環境的 Docker 安裝與管理
   DSND_FORCE_NET_MODE=full|noiptables|none   強制網路模式
   DSND_FORCE_STORAGE=overlay2|vfs            強制存儲驅動
   DSND_FORCE_INSTALL=1                       強制重裝 engine
+  DSND_USERNS_MODE=auto|never|force          dockerd 啟動包裝
+  DSND_INSTALL_SCRUB=1                       強制部署 scrub 工具鏈
+  DSND_SCRUB_URL=<base-url>                  dsnd-scrub 下載基底 URL
 EOF
     return 0
 }
@@ -863,6 +982,10 @@ main() {
         restart)
             require_root || return 1
             do_restart
+            ;;
+        scrub-pull)
+            shift
+            do_scrub_pull "$@"
             ;;
         status)
             do_status
