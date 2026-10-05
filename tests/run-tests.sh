@@ -18,7 +18,9 @@ tmpout="$(mktemp)"
 for f in "${FILES[@]}"; do
   base="$(basename "$f")"
   # Run each test file in an isolated bash: collect its own counters.
-  bash -c '
+  # per-file timeout: 掛起的測試標記 TIMEOUT 而非掛死整個 runner
+  # (WSL 非 root 下 unshare 子進程 kill/wait 偶發競態,歷史上掛過)
+  timeout -k 5 "${DSND_TEST_TIMEOUT:-90}" bash -c '
     set -u
     source "'"$SCRIPT_DIR"'/lib.sh"
     source "'"$f"'"
@@ -28,6 +30,7 @@ for f in "${FILES[@]}"; do
     done
     printf "SUMMARY %d %d %d\n" "$_DSND_TESTS_RUN" "$_DSND_TESTS_PASSED" "$_DSND_TESTS_FAILED"
   ' > "$tmpout" 2>&1
+  trc=$?
   summary="$(tail -1 "$tmpout")"
   run_count="$(awk '{print $2}' <<< "$summary")"
   if [[ "$summary" == SUMMARY\ * && "${run_count:-0}" -gt 0 ]]; then
@@ -40,7 +43,11 @@ for f in "${FILES[@]}"; do
       overall=1
     fi
   else
-    printf 'CRASH %-27s (no assertions collected)\n' "$base"
+    if [[ "$trc" == 124 ]]; then
+      printf 'TIMEOUT %-26s (per-file %ss, 掛起被終止;請檢查該文件是否觸發真實 unshare/probe)\n' "$base" "${DSND_TEST_TIMEOUT:-90}"
+    else
+      printf 'CRASH %-27s (no assertions collected)\n' "$base"
+    fi
     head -20 "$tmpout" | sed 's/^/    /'
     overall=1
   fi

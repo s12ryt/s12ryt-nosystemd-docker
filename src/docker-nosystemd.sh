@@ -226,12 +226,23 @@ probe_unshare_userns_ok() {
 
 # 對指定進程寫入 user namespace 恆等範圍映射(uid/gid 0..N-1 → 0..N-1)。
 # 需要先 deny setgroups(gid 映射的前置要求);uid_map/gid_map 寫入失敗返回 1。
+# 失敗時將具體原因記錄到全局變量 _DSND_RANGE_FAIL_REASON 供上游輸出。
 # DSND_PROC_BASE:測試鉤子(/proc 替身);DSND_USERNS_MAP_SIZE:映射寬度(默認 65536)
+# 註:重定向採「2>/dev/null > file」順序 — 先導 stderr 再開檔,open 失敗的
+# shell 錯誤才會被吞掉(「> file 2>/dev/null」順序會洩漏一行 Permission denied)
 _write_userns_maps() { # <pid>
     local base="${DSND_PROC_BASE:-/proc}"
-    echo deny > "$base/$1/setgroups" 2>/dev/null || true
-    printf '0 0 %s\n' "${DSND_USERNS_MAP_SIZE:-65536}" > "$base/$1/uid_map" 2>/dev/null || return 1
-    printf '0 0 %s\n' "${DSND_USERNS_MAP_SIZE:-65536}" > "$base/$1/gid_map" 2>/dev/null || return 1
+    _DSND_RANGE_FAIL_REASON=""
+    echo deny 2>/dev/null > "$base/$1/setgroups" || _DSND_RANGE_FAIL_REASON="setgroups deny 被拒(需 CAP_SETGID)"
+    if ! printf '0 0 %s\n' "${DSND_USERNS_MAP_SIZE:-65536}" 2>/dev/null > "$base/$1/uid_map"; then
+        _DSND_RANGE_FAIL_REASON="uid_map 寫入被拒(需 CAP_SETUID)"
+        return 1
+    fi
+    if ! printf '0 0 %s\n' "${DSND_USERNS_MAP_SIZE:-65536}" 2>/dev/null > "$base/$1/gid_map"; then
+        _DSND_RANGE_FAIL_REASON="${_DSND_RANGE_FAIL_REASON:+${_DSND_RANGE_FAIL_REASON};}gid_map 寫入被拒(需 CAP_SETGID,且需先成功 deny setgroups)"
+        return 1
+    fi
+    return 0
 }
 
 # 驗證指定進程的 uid_map 已生效(首行第三欄 = 映射寬度)
@@ -245,7 +256,8 @@ _read_userns_map_ok() { # <pid>
 # (CAP_SETUID/CAP_SETGID 或同 uid),docker pull 解壓層的 lchown(任意 uid/gid)
 # 將全落在映射內 → 不再 EINVAL。失敗返回 1。
 probe_userns_range_map_ok() {
-    command -v unshare >/dev/null 2>&1 || return 1
+    command -v unshare >/dev/null 2>&1 || { _DSND_RANGE_FAIL_REASON="unshare 命令不可用"; return 1; }
+    _DSND_RANGE_FAIL_REASON=""
     # shellcheck disable=SC2016  # 單引號內 $() 需在子 ns 的 bash 內展開
     unshare --user bash -c 'while [[ -z "$(cat /proc/self/uid_map)" ]]; do sleep 0.05; done' >/dev/null 2>&1 &
     local p=$!
@@ -254,6 +266,7 @@ probe_userns_range_map_ok() {
         wait "$p" 2>/dev/null || true
         return 0
     fi
+    [[ -z "${_DSND_RANGE_FAIL_REASON:-}" ]] && _DSND_RANGE_FAIL_REASON="uid_map 讀回驗證失敗(映射未生效)"
     kill "$p" 2>/dev/null
     wait "$p" 2>/dev/null || true
     return 1
@@ -371,7 +384,7 @@ do_start() {
             [[ -z "${DSND_QUIET:-}" ]] && log "以 user namespace 範圍映射模式啟動 dockerd(0-65535 恆等映射):層內任意 uid/gid chown 均在映射內"
             pid="$(launch_dockerd_userns_range "$dockerdbin" "$logfile")"
         else
-            [[ -z "${DSND_QUIET:-}" ]] && log "以 user namespace 單映射包裝模式啟動 dockerd(unshare -Ur -G root):docker pull 對映射外 gid 檔案仍會 EINVAL"
+            [[ -z "${DSND_QUIET:-}" ]] && log "以 user namespace 單映射包裝模式啟動 dockerd(unshare -Ur -G root):docker pull 對映射外 gid 檔案仍會 EINVAL(範圍映射不可用:${_DSND_RANGE_FAIL_REASON:-原因未知})"
             # -G root:socket group 設為 gid 0(userns 映射內);默認 docker group 的 gid
             # 不在 unshare -Ur 的單一 gid 映射內,chown docker.sock 會 EINVAL
             nohup unshare -Ur "$dockerdbin" -G root >> "$logfile" 2>&1 &
@@ -653,7 +666,7 @@ provision_with_fallback() {
                     if probe_userns_range_map_ok; then
                         log "dockerd 以 user namespace 範圍映射模式運行:層內任意 uid/gid chown 均在映射內,docker pull 可正常註冊映像層"
                     else
-                        log "dockerd 以 user namespace 單映射模式運行:映像層註冊的 unshare 將放行,但 tar 內映射外 gid 檔案(如 /etc/shadow,gid 42)chown 仍會 EINVAL"
+                        log "dockerd 以 user namespace 單映射模式運行:映像層註冊的 unshare 將放行,但 tar 內映射外 gid 檔案(如 /etc/shadow,gid 42)chown 仍會 EINVAL(範圍映射不可用:${_DSND_RANGE_FAIL_REASON:-原因未知})"
                         warn "docker pull 可能部分失敗(lchown: invalid argument);宿主以特權模式運行容器可徹底解決"
                     fi
                 else
@@ -780,7 +793,13 @@ do_doctor() {
     printf 'unshare 掛載ns: %s\n' "$(probe_unshare_mount_ok && echo '是' || echo '否(缺 CAP_SYS_ADMIN:映像層註冊將失敗,需宿主開特權)')"
     printf 'user namespace: %s\n' "$(probe_unshare_userns_ok && echo '是' || echo '否(rootless 模式不可用)')"
     printf 'userns 包裝模式: %s\n' "$(userns_wrap_needed && echo '將啟用(dockerd 包進 unshare -Ur,繞過映像層註冊 EPERM)' || echo '未啟用')"
-printf 'userns 範圍映射: %s\n' "$(probe_userns_range_map_ok && echo '可用(0-65535 恆等映射,層內任意 chown 放行)' || echo '不可用(僅單映射:pull 對映射外 gid 檔案會 EINVAL;常見於剝 CAP_SETUID 的環境)')"
+local _range_ok=0
+probe_userns_range_map_ok && _range_ok=1
+if [[ "$_range_ok" == 1 ]]; then
+    printf 'userns 範圍映射: 可用(0-65535 恆等映射,層內任意 chown 放行)\n'
+else
+    printf 'userns 範圍映射: 不可用(%s;pull 對映射外 gid 檔案會 EINVAL)\n' "${_DSND_RANGE_FAIL_REASON:-原因未知}"
+fi
     printf 'Seccomp       : %s\n' "$sec_desc"
     printf 'CapEff        : %s\n' "$cap_desc"
     printf 'daemon 狀態   : %s\n' "$(is_running && echo "運行中(PID $(cat "${DSND_PID_FILE:-/var/run/docker-nosystemd.pid}"))" || echo '未運行')"

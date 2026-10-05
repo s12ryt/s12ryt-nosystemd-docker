@@ -110,7 +110,7 @@ DSND_USERNS_MODE=auto|never|force          # dockerd 啟動包裝(見下節)
 ## 測試
 
 ```bash
-bash tests/run-tests.sh              # 單元測試(bash mini 框架,145 斷言)
+bash tests/run-tests.sh              # 單元測試(bash mini 框架,155 斷言;單文件逾時自動標記 TIMEOUT)
 bash tests/run-tests.sh && shellcheck install.sh src/docker-nosystemd.sh
 bash tests/integration/test_install_debian.sh   # 需 root + 無 systemd 的 Debian
 ```

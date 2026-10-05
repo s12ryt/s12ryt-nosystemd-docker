@@ -242,3 +242,34 @@ test_do_start_userns_range_mode() {
   rm -f "$DSND_PID_FILE"
   source "$SCRIPT_DIR/src/docker-nosystemd.sh"
 }
+
+test_write_userns_maps_records_reason() {
+  local T; T="$(t_tmpdir)"
+  local rc=0
+  # 場景1:目錄不存在 → uid_map 寫入失敗,應記錄原因
+  DSND_PROC_BASE="$T/nonexistent"
+  rc=0
+  _write_userns_maps 999 || rc=$?
+  assert_eq "uid_map 寫入失敗應返回 1" "1" "$rc"
+  assert_contains "應記錄 uid_map 失敗原因" "uid_map" "${_DSND_RANGE_FAIL_REASON:-}"
+  # 場景2:uid_map 可寫、setgroups/gid_map 為目錄(寫入必敗)→ gid_map 失敗(帶 setgroups 連帶)
+  mkdir -p "$T/proc2/123"
+  : > "$T/proc2/123/uid_map"
+  mkdir "$T/proc2/123/setgroups" "$T/proc2/123/gid_map"
+  DSND_PROC_BASE="$T/proc2"
+  rc=0
+  _write_userns_maps 123 || rc=$?
+  assert_eq "gid_map 寫入失敗應返回 1" "1" "$rc"
+  assert_contains "應記錄 gid_map 失敗原因" "gid_map" "${_DSND_RANGE_FAIL_REASON:-}"
+  assert_contains "應連帶記錄 setgroups 失敗" "setgroups" "${_DSND_RANGE_FAIL_REASON:-}"
+  # 場景3:全部可寫 → 成功且原因清空
+  rmdir "$T/proc2/123/setgroups" "$T/proc2/123/gid_map"
+  : > "$T/proc2/123/setgroups"
+  : > "$T/proc2/123/gid_map"
+  rc=0
+  _write_userns_maps 123 || rc=$?
+  assert_eq "全部寫入成功應返回 0" "0" "$rc"
+  assert_eq "成功後原因應清空" "" "${_DSND_RANGE_FAIL_REASON:-}"
+  DSND_PROC_BASE=""
+  source "$SCRIPT_DIR/src/docker-nosystemd.sh"
+}

@@ -134,3 +134,17 @@ test_doctor_mentions_unshare_seccomp_capeff() {
   assert_contains "doctor 應顯示 userns 包裝模式決策" "userns 包裝模式" "$out"
   assert_contains "doctor 應顯示 userns 範圍映射探測" "userns 範圍映射" "$out"
 }
+
+test_doctor_shows_range_fail_reason() {
+  _make_stub_bin "$T/bin-doc2" unshare 0
+  PATH="$T/bin-doc2:$PATH"
+  printf 'Seccomp:\t2\nCapEff:\t000001ffffffffff\n' > "$T/status-doc2"
+  DSND_PROC_STATUS="$T/status-doc2"
+  DSND_PID_FILE="$T/none2.pid"
+  probe_userns_range_map_ok() { return 1; }
+  _DSND_RANGE_FAIL_REASON="測試原因-xyz"
+  local out
+  out="$(do_doctor 2>&1)" || true
+  assert_contains "doctor 範圍映射不可用應顯示判定" "不可用" "$out"
+  assert_contains "doctor 範圍映射不可用應顯示具體原因" "測試原因-xyz" "$out"
+}

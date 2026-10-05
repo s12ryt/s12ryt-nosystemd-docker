@@ -119,6 +119,8 @@ test_probe_overlay_mount_ok_mount_succeeds() {
 test_doctor_mentions_overlay_mount_probe() {
   _clear_overrides
   probe_overlay_mount_ok() { return 1; }
+  # 鐵律:單元測試禁觸真實 unshare(非 root 環境 kill/wait 有競態掛起風險)
+  probe_userns_range_map_ok() { return 1; }
   DSND_PID_FILE="$T/none.pid"
   local out
   out="$(do_doctor 2>&1)" || true
@@ -160,11 +162,13 @@ test_provision_userns_mode_note() {
   DSND_FORCE_STORAGE="vfs"
   probe_unshare_mount_ok() { return 1; }
   probe_unshare_userns_ok() { return 0; }
+  probe_userns_range_map_ok() { return 1; }
   do_start() { return 0; }
   local rc=0 out
   out="$(provision_with_fallback 2>&1)" || rc=$?
   assert_eq "userns 可用時 provision 應成功" "0" "$rc"
   assert_contains "應提示以 user namespace 模式運行" "user namespace" "$out"
+  assert_contains "單映射提示應附範圍映射不可用說明" "範圍映射不可用" "$out"
   assert_not_contains "不應再出現註冊失敗警告" "register layer" "$out"
 }
 
