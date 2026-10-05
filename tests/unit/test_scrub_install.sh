@@ -106,11 +106,35 @@ test_doctor_mentions_scrub() {
     _clear_overrides
 }
 
+test_install_scrub_stops_proxy_first() {
+    curl() {
+        echo "curl $*" >> "$T/curl.calls"
+        local _out=""
+        while [[ $# -gt 0 ]]; do
+            if [[ "$1" == "-o" && -n "${2:-}" ]]; then _out="$2"; shift 2; continue; fi
+            shift
+        done
+        [[ -n "$_out" ]] && printf '#!/bin/sh\n' > "$_out"
+        return 0
+    }
+    apt-get() { echo "apt-get $*" >> "$T/apt.calls"; }
+    uname() { echo x86_64; }
+    proxy_stop() { touch "$T/proxy-stopped.marker"; }
+    export DSND_BIN_DIR="$T/bin"
+    export DSND_SCRUB_URL="https://example.com/dsnd-scrub-test"
+    export DSND_SKOPEO_BIN="$T/no-skopeo"
+    install_scrub_tools >/dev/null 2>&1 || true
+    assert_file_exists "install_scrub_tools 應先停 proxy 釋放二進制(防 ETXTBSY)" "$T/proxy-stopped.marker"
+    _clear_overrides
+    unset DSND_BIN_DIR DSND_SCRUB_URL DSND_SKOPEO_BIN
+}
+
 # ---------------------------------------------------------------
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
     for _t in test_scrub_needed_matrix test_install_scrub_tools_deploys \
         test_install_scrub_tools_skips_when_not_needed test_scrub_pull_command \
-        test_scrub_pull_requires_bin test_doctor_mentions_scrub; do
+        test_scrub_pull_requires_bin test_doctor_mentions_scrub \
+        test_install_scrub_stops_proxy_first; do
         "$_t"
     done
     summary "test_scrub_install.sh"

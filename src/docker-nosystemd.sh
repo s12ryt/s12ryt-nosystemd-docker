@@ -694,6 +694,10 @@ install_scrub_tools() {
     if [[ "${DSND_INSTALL_SCRUB:-0}" != "1" ]] && ! scrub_needed; then
         return 0
     fi
+    # 先冪等停舊 scrub proxy,釋放其佔用的 dsnd-scrub 二進制 —
+    # 否則 curl 下載覆蓋執行中的二進制會 ETXTBSY(curl: (23) write 失敗)。
+    # (do_install 中本函數在 provision/do_stop 之前執行,舊 proxy 此時仍在運行)
+    proxy_stop || true
     local bindir="${DSND_BIN_DIR:-/usr/local/bin}"
     local arch
     case "$(uname -m)" in
