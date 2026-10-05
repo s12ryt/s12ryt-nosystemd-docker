@@ -173,6 +173,7 @@ EOF
   while [[ ! -s "$T/unshare1.args" && $_i -lt 50 ]]; do sleep 0.1; _i=$((_i + 1)); done
   assert_contains "啟動命令應含 unshare -Ur" "-Ur" "$(cat "$T/unshare1.args" 2>/dev/null || echo MISSING)"
   assert_contains "unshare 應包裹 dockerdbin" "$DSND_DOCKERD_BIN" "$(cat "$T/unshare1.args" 2>/dev/null || echo MISSING)"
+  assert_contains "包裝模式應傳 -G root(socket chown 需在 gid 映射內)" "-G root" "$(cat "$T/unshare1.args" 2>/dev/null || echo MISSING)"
   do_stop >/dev/null 2>&1 || true
   source "$SCRIPT_DIR/src/docker-nosystemd.sh"
 }

@@ -312,8 +312,10 @@ do_start() {
     fi
     rm -f "$pidfile"
     if userns_wrap_needed; then
-        [[ -z "${DSND_QUIET:-}" ]] && log "以 user namespace 包裝模式啟動 dockerd(unshare -Ur):映像層註冊將於 ns 內取得 CAP_SYS_ADMIN"
-        nohup unshare -Ur "$dockerdbin" >> "$logfile" 2>&1 &
+        [[ -z "${DSND_QUIET:-}" ]] && log "以 user namespace 包裝模式啟動 dockerd(unshare -Ur -G root):映像層註冊將於 ns 內取得 CAP_SYS_ADMIN"
+        # -G root:socket group 設為 gid 0(userns 映射內);默認 docker group 的 gid
+        # 不在 unshare -Ur 的單一 gid 映射內,chown docker.sock 會 EINVAL
+        nohup unshare -Ur "$dockerdbin" -G root >> "$logfile" 2>&1 &
     else
         nohup "$dockerdbin" >> "$logfile" 2>&1 &
     fi

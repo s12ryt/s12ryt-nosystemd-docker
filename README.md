@@ -89,6 +89,7 @@ DSND_USERNS_MODE=auto|never|force          # dockerd 啟動包裝(見下節)
 - `never`:禁用;`force`:只要 userns 可行就包裝
 - 探測命令:`unshare -U true && echo 可行`(失敗 = 核心/seccomp 擋了 userns,此模式無法使用)
 - `doctor` 會顯示 `userns 包裝模式` 決策結果
+- 包裝模式會自動傳 `-G root` 給 dockerd:unix socket 的 group 改為映射內的 gid 0,否則 chown `/var/run/docker.sock` 到默認 `docker` group(映射外 gid)會報 `invalid argument`
 
 此模式配搭 `vfs` 存儲 + `bridge=none` 網路(腳本會自動降級)即為無特權容器的完整組合;`docker pull` / `docker run` 行為需實機驗證。
 
@@ -102,7 +103,7 @@ DSND_USERNS_MODE=auto|never|force          # dockerd 啟動包裝(見下節)
 ## 測試
 
 ```bash
-bash tests/run-tests.sh              # 單元測試(bash mini 框架,135 斷言)
+bash tests/run-tests.sh              # 單元測試(bash mini 框架,136 斷言)
 bash tests/run-tests.sh && shellcheck install.sh src/docker-nosystemd.sh
 bash tests/integration/test_install_debian.sh   # 需 root + 無 systemd 的 Debian
 ```
