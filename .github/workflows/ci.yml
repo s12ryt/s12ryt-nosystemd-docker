@@ -1,0 +1,30 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install shellcheck
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+
+      - name: Bash unit tests
+        run: bash tests/run-tests.sh
+
+      - name: Shellcheck
+        run: shellcheck install.sh src/docker-nosystemd.sh tools/scrub-pull.sh
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+
+      - name: dsnd-scrub Go tests
+        run: cd tools/dsnd-scrub && go test ./...

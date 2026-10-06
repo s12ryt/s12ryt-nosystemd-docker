@@ -1147,11 +1147,15 @@ do_install() {
     # 3) 啟動 + 自啟配置
     if [[ "$init" == "systemd" ]]; then
         log "檢測到 systemd,使用 systemctl 啟用…"
-        if systemctl enable --now docker >/dev/null 2>&1; then
+        # K8s unprivileged pod 常見:/run/systemd 殘留 + apt postinst 已建
+        # unit symlink → systemctl enable 靜默返回 0 但 daemon 從未運行。
+        # 必須等 daemon 真的 ready 才算成功(短超時,避免失敗場景等滿默認值)。
+        if systemctl enable --now docker >/dev/null 2>&1 \
+            && DSND_READY_TIMEOUT="${DSND_SYSTEMD_WAIT:-8}" wait_daemon_ready; then
             print_summary "$distro" "systemd"
             return 0
         fi
-        warn "systemctl 啟用失敗,改用無 systemd 手動模式"
+        warn "systemctl 未能在本環境啟動 dockerd(K8s 容器常見:/run/systemd 殘留但 bus 不可用),改用手動模式"
     fi
     # 單映射(pull 會死)環境:先部署映像清洗工具鏈(dsnd-scrub + skopeo + docker 包裝),
     # 並啟動本地 scrub proxy + 注入 registry-mirrors — 讓 docker pull 透明走清洗

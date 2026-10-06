@@ -209,13 +209,51 @@ EOF
     _clear_overrides
 }
 
+# do_install 的 systemd 分支只看 systemctl 退出碼 — K8s pod 常見 /run/systemd
+# 殘留 + apt postinst 建 symlink,使 enable 靜默成功但 daemon 從未運行。
+# 修復後 systemd 路徑還需 wait_daemon_ready 通過,否則 fallback 手動模式。
+test_install_falls_back_when_systemd_dead() {
+    _clear_overrides
+    local T2
+    T2="$(t_tmpdir)"
+    # PATH 前綴放 fake dockerd stub(do_install 用 command -v 檢查)
+    mkdir -p "$T2/bin"
+    printf '#!/bin/sh\nexit 0\n' > "$T2/bin/dockerd"
+    chmod +x "$T2/bin/dockerd"
+    detect_distro() { echo ubuntu; }
+    detect_init() { echo systemd; }
+    install_docker_apt() { return 0; }
+    install_docker_alpine() { return 0; }
+    ensure_compose() { return 0; }
+    install_self() { return 0; }
+    systemctl() { return 0; }          # K8s 殘留:enable 偽成功
+    wait_daemon_ready() { return 1; }  # daemon 實際沒起來
+    install_scrub_tools() { return 0; }
+    scrub_needed() { return 1; }
+    proxy_start() { return 0; }
+    provision_with_fallback() { touch "$T2/provisioned"; return 0; }
+    inject_autostart() { return 0; }
+    print_summary() { echo "$2" > "$T2/method"; return 0; }
+    local saved_path="$PATH"
+    export PATH="$T2/bin:$PATH"
+    export DSND_QUIET=1
+    do_install >/dev/null 2>&1 || true
+    export PATH="$saved_path"
+    unset DSND_QUIET
+    assert_file_exists "daemon 未 ready 應 fallback 跑 provision" "$T2/provisioned"
+    assert_contains "摘要應走手動模式而非 systemd" "rc.local" "$(cat "$T2/method" 2>/dev/null)"
+    rm -rf "$T2"
+    _clear_overrides
+}
+
 # ── runner ──
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
     for _t in test_scrub_run_executes_chroot test_scrub_run_rm_cleans_rootfs \
         test_scrub_run_keeps_rootfs_without_rm test_scrub_run_missing_image_fails \
         test_scrub_run_env_option test_scrub_run_volume_option test_scrub_run_detach \
         test_scrub_run_workdir test_scrub_run_entrypoint test_scrub_run_ignores_common_flags \
-        test_scrub_run_defaults_to_image_cmd test_cr_ps_parses_meta; do
+        test_scrub_run_defaults_to_image_cmd test_cr_ps_parses_meta \
+        test_install_falls_back_when_systemd_dead; do
         "$_t"
     done
     summary "test_scrub_run.sh"
