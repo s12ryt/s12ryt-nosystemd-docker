@@ -789,8 +789,9 @@ do_scrub_pull() {
     [[ -x "$scrubbin" ]] || die "dsnd-scrub 不存在($scrubbin);請重新執行 install 或手動部署"
     command -v "$skopeobin" >/dev/null 2>&1 || die "skopeo 不可用;請安裝(apt-get install -y skopeo)"
     local tmp_raw tmp_clean
-    tmp_raw="$(mktemp "${TMPDIR:-/tmp}/dsnd-pull-raw.XXXXXX.tar")"
-    tmp_clean="$(mktemp "${TMPDIR:-/tmp}/dsnd-pull-clean.XXXXXX.tar")"
+    # busybox mktemp(Alpine)要求模板以 X 結尾,不支援 .tar 後綴
+    tmp_raw="$(mktemp "${TMPDIR:-/tmp}/dsnd-pull-raw.XXXXXX")"
+    tmp_clean="$(mktemp "${TMPDIR:-/tmp}/dsnd-pull-clean.XXXXXX")"
     # shellcheck disable=SC2064 # trap 展開此刻的變量
     trap "rm -f '$tmp_raw' '$tmp_clean'" RETURN
     log "下載映像(不經 dockerd):$ref"

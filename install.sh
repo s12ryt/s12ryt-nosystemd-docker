@@ -35,7 +35,8 @@ main() {
     set -- install
   fi
   local tmp rc=0
-  tmp="$(mktemp /tmp/docker-nosystemd.XXXXXX.sh)" || die "mktemp 失敗"
+  # busybox mktemp(Alpine)要求模板以 X 結尾,不支援 .sh 後綴
+  tmp="$(mktemp /tmp/docker-nosystemd.XXXXXX)" || die "mktemp 失敗"
   if ! download_main_script "$tmp"; then
     rm -f "$tmp"
     die "無法取得 docker-nosystemd.sh"
