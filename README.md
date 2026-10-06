@@ -7,20 +7,20 @@
 ## 一鍵安裝
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/s12ryt/s12ryt-nosystemd-docker/main/install.sh | sudo bash
+sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/s12ryt/s12ryt-nosystemd-docker/main/install.sh)"
 ```
 
 或使用 `wget`:
 
 ```bash
-wget -qO- https://raw.githubusercontent.com/s12ryt/s12ryt-nosystemd-docker/main/install.sh | sudo bash
+sudo bash -c "$(wget -qO- https://raw.githubusercontent.com/s12ryt/s12ryt-nosystemd-docker/main/install.sh)"
 ```
 
 Alpine(預設無 bash / sudo,先以 root 安裝依賴):
 
 ```sh
 apk add bash curl
-curl -fsSL https://raw.githubusercontent.com/s12ryt/s12ryt-nosystemd-docker/main/install.sh | bash
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/s12ryt/s12ryt-nosystemd-docker/main/install.sh)"
 ```
 
 安裝完成後即可使用 `docker` / `docker compose`,並可透過 `docker-nosystemd` 命令管理 daemon。
