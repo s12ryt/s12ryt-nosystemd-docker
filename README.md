@@ -6,17 +6,19 @@
 
 ## 一鍵安裝
 
+> **需要以 root 身份運行** — 先 `su -` 或 `sudo -i` 進入 root shell 再執行以下指令。
+
 ```bash
-sudo bash <(curl -fsSL https://raw.githubusercontent.com/s12ryt/s12ryt-nosystemd-docker/main/install.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/s12ryt/s12ryt-nosystemd-docker/main/install.sh)
 ```
 
 或使用 `wget`:
 
 ```bash
-sudo bash <(wget -qO- https://raw.githubusercontent.com/s12ryt/s12ryt-nosystemd-docker/main/install.sh)
+bash <(wget -qO- https://raw.githubusercontent.com/s12ryt/s12ryt-nosystemd-docker/main/install.sh)
 ```
 
-Alpine(預設無 bash / sudo,先以 root 安裝依賴):
+Alpine(預設無 bash,先以 root 安裝依賴):
 
 ```sh
 apk add bash curl
