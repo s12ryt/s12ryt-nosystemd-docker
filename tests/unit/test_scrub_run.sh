@@ -156,12 +156,46 @@ test_scrub_run_ignores_common_flags() {
     _clear_overrides
 }
 
+test_scrub_run_defaults_to_image_cmd() {
+    _clear_overrides
+    : > "$T/docker.calls"
+    : > "$T/chroot.calls"
+    docker() {
+        echo "docker $*" >> "$T/docker.calls"
+        case "$1" in
+            create) echo "fake-cid-123" ;;
+            export)
+                mkdir -p "$T/export-src"
+                echo stub-content > "$T/export-src/stub.txt"
+                tar -c -C "$T/export-src" stub.txt
+                ;;
+            image)
+                case "$*" in
+                    *Entrypoint*) echo '["/app/server","--mode"]' ;;
+                    *Cmd*) echo '["serve"]' ;;
+                esac
+                ;;
+            *) return 0 ;;
+        esac
+    }
+    chroot() {
+        echo "chroot $*" >> "$T/chroot.calls"
+        return 0
+    }
+    export DSND_CHROOT_ROOT="$T/chroots9"
+    do_scrub_run busybox:latest >/dev/null 2>&1 || true
+    assert_contains "無 cmd 應使用映像默認 Entrypoint+Cmd" "/app/server --mode serve" "$(cat "$T/chroot.calls")"
+    unset DSND_CHROOT_ROOT
+    _clear_overrides
+}
+
 # ── runner ──
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
     for _t in test_scrub_run_executes_chroot test_scrub_run_rm_cleans_rootfs \
         test_scrub_run_keeps_rootfs_without_rm test_scrub_run_missing_image_fails \
         test_scrub_run_env_option test_scrub_run_volume_option test_scrub_run_detach \
-        test_scrub_run_workdir test_scrub_run_entrypoint test_scrub_run_ignores_common_flags; do
+        test_scrub_run_workdir test_scrub_run_entrypoint test_scrub_run_ignores_common_flags \
+        test_scrub_run_defaults_to_image_cmd; do
         "$_t"
     done
     summary "test_scrub_run.sh"

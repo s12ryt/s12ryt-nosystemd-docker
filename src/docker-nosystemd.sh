@@ -806,6 +806,24 @@ do_scrub_pull() {
     log "完成:$ref 已以清洗後形式載入(屬主全為 root:root)"
 }
 
+# 解析 JSON 字串陣列(["a","b"])為逐行輸出(供 mapfile);空/null 輸出空。
+# 簡化解析:僅適用映像 Entrypoint/Cmd 這類簡單詞元素(無內嵌逗號/引號)。
+_dsnd_json_arr_to_args() {
+    local s="${1:-}"
+    s="${s#\[}"
+    s="${s%\]}"
+    [[ -z "$s" || "$s" == "null" ]] && return 0
+    local part
+    local IFS=','
+    for part in $s; do
+        part="${part#\"}"
+        part="${part%\"}"
+        part="${part//\\\"/\"}"
+        printf '%s\n' "$part"
+    done
+    return 0
+}
+
 # scrub-run:docker create → export 解出 → chroot 執行(「窮人容器」)
 # 適用:沙箱連 OCI runtime rootless 都焊死(cgroup ro + mount seccomp)、
 # 但 chroot 可用的環境(如 K8s unprivileged pod)。無 ns/cgroup 隔離,
@@ -844,11 +862,27 @@ do_scrub_run() {
     shift
     local -a cmd=()
     [[ $# -gt 0 ]] && cmd=("$@")
-    if [[ -n "$entrypoint" ]]; then
-        cmd=("$entrypoint" "${cmd[@]}")
-    fi
-    [[ ${#cmd[@]} -gt 0 ]] || die "未指定要執行的命令(用法:docker-nosystemd run [選項] <image> <cmd> [args...])"
     local dockerbin="${DSND_DOCKER_BIN:-docker}"
+    # docker 語義:未指定命令時用映像默認 ENTRYPOINT+CMD(docker image inspect)
+    local -a img_ep=() img_cmd=()
+    if [[ ${#cmd[@]} -eq 0 || -z "$entrypoint" ]]; then
+        local _j
+        _j="$("$dockerbin" image inspect --format '{{json .Config.Entrypoint}}' "$image" 2>/dev/null || true)"
+        mapfile -t img_ep < <(_dsnd_json_arr_to_args "$_j")
+        _j="$("$dockerbin" image inspect --format '{{json .Config.Cmd}}' "$image" 2>/dev/null || true)"
+        mapfile -t img_cmd < <(_dsnd_json_arr_to_args "$_j")
+    fi
+    if [[ -n "$entrypoint" ]]; then
+        # --entrypoint 覆寫:entrypoint + (用戶 cmd 或映像 CMD)
+        [[ ${#cmd[@]} -eq 0 ]] && cmd=("${img_cmd[@]}")
+        cmd=("$entrypoint" "${cmd[@]}")
+    elif [[ ${#cmd[@]} -eq 0 ]]; then
+        cmd=("${img_ep[@]}" "${img_cmd[@]}")
+    elif [[ ${#img_ep[@]} -gt 0 ]]; then
+        # 用戶命令作為映像 ENTRYPOINT 的參數(docker 語義)
+        cmd=("${img_ep[@]}" "${cmd[@]}")
+    fi
+    [[ ${#cmd[@]} -gt 0 ]] || die "未指定要執行的命令,且映像無默認 CMD(用法:docker-nosystemd run [選項] <image> [cmd...])"
     local base="${DSND_CHROOT_ROOT:-/var/lib/dsnd-chroot}"
     local cid
     cid="$("$dockerbin" create "$image" 2>/dev/null)" || die "docker create 失敗(映像存在嗎?$image)"
