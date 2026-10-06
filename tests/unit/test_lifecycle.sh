@@ -16,7 +16,9 @@ _setup_fake() {
   cat > "$DSND_DOCKERD_BIN" <<'EOF'
 #!/usr/bin/env bash
 echo "fake-dockerd started"
-exec sleep 300
+# 用 tail 而非 sleep 駐留:GitHub Actions 的孤兒進程清理器會終結
+# 背景 sleep 進程,導致 is_running 誤判(dockerd「啟動即死」)。
+exec tail -f /dev/null
 EOF
   chmod +x "$DSND_DOCKERD_BIN"
 }
@@ -102,7 +104,7 @@ test_wait_ready_timeout() {
 test_do_start_adopts_live_dockerd() {
   # 模拟:dockerd 默認 pidfile 指向一個活進程(如 systemd 起的 dockerd 殘留)
   _setup_fake
-  sleep 300 & local adopted=$!
+  tail -f /dev/null & local adopted=$!
   echo "$adopted" > "$DSND_DOCKERD_DEFAULT_PIDFILE"
   rm -f "$DSND_PID_FILE"
   DSND_QUIET=1 do_start >/dev/null 2>&1

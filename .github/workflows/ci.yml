@@ -7,13 +7,37 @@ on:
     branches: [main]
 
 jobs:
-  test:
+  unit:
+    name: unit (${{ matrix.os }})
     runs-on: ubuntu-latest
+    container: ${{ matrix.image }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: debian-13
+            image: "debian:13"
+          - os: ubuntu-24.04
+            image: "ubuntu:24.04"
+          - os: alpine
+            image: "alpine:latest"
     steps:
-      - uses: actions/checkout@v4
+      - name: Install deps (apt)
+        if: matrix.os != 'alpine'
+        run: apt-get update -qq && apt-get install -y -qq bash shellcheck python3 git ca-certificates
 
-      - name: Install shellcheck
-        run: sudo apt-get update && sudo apt-get install -y shellcheck
+      - name: Install deps (apk)
+        if: matrix.os == 'alpine'
+        run: apk add --no-cache bash shellcheck python3 git
+
+      # 容器內不用 actions/checkout(node runtime 在 musl/glibc 容器相容性差),
+      # 直接以 git fetch 簽出觸發 commit
+      - name: Checkout (git)
+        run: |
+          git init -q .
+          git remote add origin "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY"
+          git fetch --depth 1 origin "$GITHUB_SHA"
+          git checkout -q FETCH_HEAD
 
       - name: Bash unit tests
         run: bash tests/run-tests.sh
@@ -21,10 +45,15 @@ jobs:
       - name: Shellcheck
         run: shellcheck install.sh src/docker-nosystemd.sh tools/scrub-pull.sh
 
-      - name: Set up Go
-        uses: actions/setup-go@v5
+  go-test:
+    name: dsnd-scrub go tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
         with:
           go-version: "1.24"
 
-      - name: dsnd-scrub Go tests
+      - name: Go tests
         run: cd tools/dsnd-scrub && go test ./...
