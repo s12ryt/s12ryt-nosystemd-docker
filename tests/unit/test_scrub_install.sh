@@ -43,6 +43,7 @@ test_install_scrub_tools_deploys() {
     }
     apt-get() { echo "apt-get $*" >> "$T/apt.calls"; return 0; }
     uname() { echo x86_64; }
+    scrub_needed() { return 0; }  # CI 容器 root 下探測路徑不同,顯式 stub(部署測試不依賴宿主環境)
     DSND_BIN_DIR="$bindir" DSND_SCRUB_URL="https://example.com/dsnd-scrub-test" \
         DSND_SKOPEO_BIN="$T/no-skopeo" \
         install_scrub_tools >/dev/null 2>&1
@@ -126,6 +127,7 @@ test_install_scrub_stops_proxy_first() {
     }
     apt-get() { echo "apt-get $*" >> "$T/apt.calls"; }
     uname() { echo x86_64; }
+    scrub_needed() { return 0; }  # CI 容器 root 下探測路徑不同,顯式 stub(部署測試不依賴宿主環境)
     proxy_stop() { touch "$T/proxy-stopped.marker"; }
     export DSND_BIN_DIR="$T/bin"
     export DSND_SCRUB_URL="https://example.com/dsnd-scrub-test"
@@ -161,6 +163,7 @@ test_wrapper_intercepts_run_and_ps() {
     }
     apt-get() { return 0; }
     uname() { echo x86_64; }
+    scrub_needed() { return 0; }  # CI 容器 root 下探測路徑不同,顯式 stub(部署測試不依賴宿主環境)
     proxy_stop() { return 0; }
     export DSND_BIN_DIR="$W/bin"
     export DSND_SCRUB_URL="https://example.com/dsnd-scrub-test"
