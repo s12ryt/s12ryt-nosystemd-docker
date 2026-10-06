@@ -971,21 +971,22 @@ _dsnd_cr_meta() { # <name> — 輸出 meta 檔路徑
 
 dsnd_cr_ps() {
     local base="${DSND_CHROOT_ROOT:-/var/lib/dsnd-chroot}"
-    local d name pid img created status
+    local d status
+    # meta.env 以大寫鍵寫入(NAME/IMAGE/PID/CREATED/LOG),source 後直接讀
+    # shellcheck disable=SC2034  # 由 meta.env source 注入
+    local NAME="" IMAGE="" PID="" CREATED="" LOG=""
     printf '%-24s %-28s %-8s %-10s %s\n' NAME IMAGE PID STATUS CREATED
     for d in "$base"/containers/*/; do
         [[ -f "$d/meta.env" ]] || continue
-        name=""; pid=""; img=""; created=""
+        NAME=""; IMAGE=""; PID=""; CREATED=""; LOG=""
         # shellcheck disable=SC1090
         # shellcheck disable=SC1091  # 動態路徑的 meta 狀態檔
         . "$d/meta.env" 2>/dev/null || true
         status="Exited"
-        if [[ -n "${pid:-}" ]] && kill -0 "$pid" 2>/dev/null; then
+        if [[ -n "${PID:-}" ]] && kill -0 "$PID" 2>/dev/null; then
             status="Running"
         fi
-        printf '%-24s %-28s %-8s %-10s %s\n' "${name:-?}" "${img:-?}" "${pid:--}" "$status" "${created:-?}"
-        # 防迭代污染:清掉本輪變量
-        name=""; pid=""; img=""; created=""
+        printf '%-24s %-28s %-8s %-10s %s\n' "${NAME:-?}" "${IMAGE:-?}" "${PID:--}" "$status" "${CREATED:-?}"
     done
     return 0
 }

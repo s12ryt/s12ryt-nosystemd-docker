@@ -189,13 +189,33 @@ test_scrub_run_defaults_to_image_cmd() {
     _clear_overrides
 }
 
+test_cr_ps_parses_meta() {
+    _clear_overrides
+    local T2
+    T2="$(t_tmpdir)"
+    mkdir -p "$T2/containers/app1"
+    cat > "$T2/containers/app1/meta.env" <<EOF
+NAME=app1
+IMAGE=busybox:latest
+PID=$$
+CREATED=2026-10-06 00:00:00
+LOG=$T2/app1.log
+EOF
+    local out
+    out="$(DSND_CHROOT_ROOT="$T2" dsnd_cr_ps)"
+    assert_contains "ps 應顯示容器名(meta 大寫鍵)" "app1" "$out"
+    assert_contains "ps 應顯示 Running(活 PID)" "Running" "$out"
+    assert_contains "ps 應顯示映像" "busybox:latest" "$out"
+    _clear_overrides
+}
+
 # ── runner ──
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
     for _t in test_scrub_run_executes_chroot test_scrub_run_rm_cleans_rootfs \
         test_scrub_run_keeps_rootfs_without_rm test_scrub_run_missing_image_fails \
         test_scrub_run_env_option test_scrub_run_volume_option test_scrub_run_detach \
         test_scrub_run_workdir test_scrub_run_entrypoint test_scrub_run_ignores_common_flags \
-        test_scrub_run_defaults_to_image_cmd; do
+        test_scrub_run_defaults_to_image_cmd test_cr_ps_parses_meta; do
         "$_t"
     done
     summary "test_scrub_run.sh"
