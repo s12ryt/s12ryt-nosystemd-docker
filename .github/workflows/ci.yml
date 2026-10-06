@@ -34,6 +34,7 @@ jobs:
       # 直接以 git fetch 簽出觸發 commit
       - name: Checkout (git)
         run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
           git init -q .
           git remote add origin "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY"
           git fetch --depth 1 origin "$GITHUB_SHA"
